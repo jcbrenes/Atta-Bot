@@ -20,4 +20,4 @@ Developed by the Multiple Robotics Research Group (GIRoM) at the Costa Rica Inst
 Please follow the coding or programming standard for any contribution to the project [Contributing.md]
 
 
-[Contributing.md]: <https://github.com/jcbrenes/Atta-Bot-STEM/blob/main/CONTRIBUTING.MD>
+[Contributing.md]: <https://github.com/jcbrenes/Atta-Bot/blob/main/Contributing.MD>
