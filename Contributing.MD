@@ -10,18 +10,18 @@ This is a formatting and documentation guide for the C++ code in the project. Pl
 
 - Use descriptive names, even if they are long.
 ```sh
-`contadorPulsosMotorDerecho // **good**`
-`sum, j, pos // **bad**`
+contadorPulsosMotorDerecho // **good**
+sum, j, pos // **bad**
 ```
 
 - If a variable will not be modified in the code, it should be declared as `const`. This helps the compiler make the code more efficient.
 ```sh
-`const int velocidadRefDerecha`
+const int velocidadRefDerecha
 ```
 - Avoid using magic numbers (constants) directly in the code. While they may make sense at the moment, they can be forgotten after 48 hours. Instead, create a constant variable at the beginning of the code.
 ```sh
-`if (contadorPulsosMotorDerecho > 100) // **bad**`
-`if (contadorPulsosMotorDerecho > velocidadRefDerecha) // **good**`
+if (contadorPulsosMotorDerecho > 100) // **bad**
+if (contadorPulsosMotorDerecho > velocidadRefDerecha) // **good**
 ```
 
 # Functions and Classes:
