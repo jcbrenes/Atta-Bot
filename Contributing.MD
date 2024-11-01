@@ -9,15 +9,20 @@ This is a formatting and documentation guide for the C++ code in the project. Pl
 - Names should always start with a lowercase letter.
 
 - Use descriptive names, even if they are long.
+```sh
 `contadorPulsosMotorDerecho // **good**`
 `sum, j, pos // **bad**`
+```
 
 - If a variable will not be modified in the code, it should be declared as `const`. This helps the compiler make the code more efficient.
+```sh
 `const int velocidadRefDerecha`
-
+```
 - Avoid using magic numbers (constants) directly in the code. While they may make sense at the moment, they can be forgotten after 48 hours. Instead, create a constant variable at the beginning of the code.
+```sh
 `if (contadorPulsosMotorDerecho > 100) // **bad**`
 `if (contadorPulsosMotorDerecho > velocidadRefDerecha) // **good**`
+```
 
 # Functions and Classes:
 
@@ -27,7 +32,7 @@ This is a formatting and documentation guide for the C++ code in the project. Pl
 
 - Each function should have a description box above the function name, detailing what the function does, its parameters, and its return value. This format allows documentation tools to recognize it.
 
-```cpp
+```sh
 //******************************************************************************************************************
 // Function that increments a counter with each encoder pulse. (One summary sentence)
 //
@@ -42,6 +47,7 @@ int IncrementoContador (int contadorPulsosMotorDerecho, int incrementoPulso){
   int contadorIncrementado = contadorPulsosMotorDerecho + incrementoPulso;
   return contadorIncrementado;
 }
+```
 
 # Other Considerations:
 - With descriptive names, the code should be self-explanatory. However, additional comments can be added as needed.
