@@ -12,7 +12,7 @@ Developed by the Multiple Robotics Research Group (GIRoM) at the Costa Rica Inst
 ## Folder directory
 - Base -> Code for the computer running as the base with camera
 - Docs -> Documentation on materials, construction, system architecture 
-- Chasis -> Construction files and 3D models for the robot chasis
+- Chassis -> Construction files and 3D models for the robot chasis
 - Robot controller -> Code for the robot's microcontroller
 - Scenario -> Construction files and 3D models for the swarm scenario 
 
