@@ -1,0 +1,67 @@
+{
+    "general": {
+        "debug_enable": false,
+        "path_save_videos": "Videos",
+        "path_save_position_logs": "PositionLogs",
+        "path_save_console_logs": "ConsoleLogs"
+    },
+    "udp_communication": {
+        "base_ip": "192.168.137.1",
+        "broadcast_ip": "192.168.137.255",
+        "port": 6060
+    },
+    "vision_system": {
+        "path_cameraMatrix": "cameraMatrix.txt",
+        "path_distance": "dist.txt",
+        "debug_resolution": "640x360",
+        "camera_resolution": "1920x1080",
+        "mmPixel": "39/23",
+        "frame_processing_interval": 0.2,
+        "distance_between_centers": 45,
+        "circles_radius": {
+            "small_circle": 20,
+            "big_circle": 50,
+            "margin_percentage": 35
+        }
+    },
+    "colors": {
+        "magenta": {
+            "light": [145, 50, 150],
+            "dark": [180, 200, 200]
+        },
+        "amarillo": {
+            "light": [27, 50, 50],
+            "dark": [40, 255, 255]
+        },
+        "azul": {
+            "light": [100, 200, 50],
+            "dark": [120, 255, 200]
+        }
+    },
+    "robots": {
+        "1": {
+            "name": "Robot_Amarillo-Magenta",
+            "colors": ["amarillo", "magenta"]
+        },
+        "2": {
+            "name": "Robot_Magenta-Amarillo",
+            "colors": ["magenta", "amarillo"]
+        },
+        "3": {
+            "name": "Robot_Amarillo-Azul",
+            "colors": ["amarillo", "azul"]
+        },
+        "4": {
+            "name": "Robot_Azul-Amarillo",
+            "colors": ["azul", "amarillo"]
+        },
+        "5": {
+            "name": "Robot_Magenta-Azul",
+            "colors": ["magenta", "azul"]
+        },
+        "6": {
+            "name": "Robot_Azul-Magenta",
+            "colors": ["azul", "magenta"]
+        }     
+    }   
+}
