@@ -1,9 +1,10 @@
 #include "utils.h"
 #include <Adafruit_APDS9960.h> // Adafruit_APDS9960. v1.3.0
 #include <EEPROM.h>
-#include <Freenove_WS2812_Lib_for_ESP32.h> // Freenove WS2812 Lib for ESP32. v1.0.5
+#include <FastLED.h> // FastLED by Daniel Garcia. v 3.10.2
 #include <ICM_20948.h> // SparkFun ICM-20948 Arduino Library. v1.2.12
-#include <Servo.h> // ServoESP32. v1.03
+#include <ESP32Servo.h> // ESP32Servo Kevin Harrington v3.0.9
+//#include <ESPmDNS.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
@@ -42,6 +43,7 @@
 #define batteryStatus 19
 #define ledPin 2
 #define AD0_VAL 1
+#define NUM_LEDS 1  
 
 // Constantes para el WiFi
 const char* ssid = "Atta-Bot";
@@ -50,7 +52,7 @@ const unsigned int localPort = 6060;
 char receivedPacket[255];
 
 // Constantes del robot empleado
-const float pulsesPerRev = 574;             // Cantidad de pulsos por revolucion
+const float pulsesPerRev = 820;             // Cantidad de pulsos por revolucion
 const float wheelCircumference = PI * 44.5;  // Diametro de la rueda = 44.5mm
 const float millimetersPerPulse = wheelCircumference / (float)pulsesPerRev;
 const float centerToWheelDistance = 41.5;  // Radio de giro del carro, es la distancia en mm entre el centro y una rueda.
@@ -58,7 +60,7 @@ const float centerToWheelDistance = 41.5;  // Radio de giro del carro, es la dis
 // Muestreo velocidad
 const unsigned int samplingTime = 10;  // en ms
 const float samplingTimeS = (float)samplingTime * 0.001;
-unsigned long currentMillis = millis();
+unsigned long currentMillis = millis( );
 unsigned long previousMillis = millis();
 unsigned long previousMillisRW = 0;
 const unsigned int SteadyStateTime = 800;
@@ -111,6 +113,22 @@ int obstacleSensors;
 int centralDistance;
 const int reverseDistance = -40;  // mm
 
+// Constantes para la maniobra de evasión
+float originalMoveDistance = 0.0;       
+float originalLeftDistance = 0.0;       
+float originalRightDistance = 0.0;      
+int evasionStep = 0;                     
+bool scanCompleted = false;              
+int bestDirection = 0;                   
+int maxDetectedDistance = 0;             
+int currentScanIndex = 0;                
+
+const float maxLateralDistance = 100.0;  
+const int scanAngles[] = {45, 90, 135};  
+const int minClearDistance = 200;        
+const float evasionDistance = 150.0;    /
+
+
 int debugUdp = 0;
 int debugCounter = 0;
 char direction = '+';
@@ -127,7 +145,8 @@ enum PossibleStates { WAIT = 0,
                       REVERSE,
                       RANDOM_WALK,
                       MESSAGE_BASE,
-                      IDENTIFY_OBSTACLE };
+                      IDENTIFY_OBSTACLE,
+                      ACTIVE_EVASION };
 
 PossibleStates state = WAIT;
 float instructionValue = 100;
@@ -163,12 +182,60 @@ pose robotPose(0, 0, 0);
 int countMessages = 0;
 int sendMessages = 0;
 
+// Estructura para controlar el estado del servo y el barrido continuo
+struct ServoController {
+  enum State {
+    IDLE,
+    SWEEPING_CONTINUOUS
+  };
+  
+  State state = IDLE;
+  int currentAngle = 90;
+  int startAngle = 0;
+  int endAngle = 180;
+  int stepSize = 5;
+  int delayMs = 50;  // Velocidad de barrido
+  unsigned long lastMoveTime = 0;
+  int direction = 1;
+  bool sweepActive = false;
+};
+
+ServoController servoCtrl;
 Servo frontServo;
 Adafruit_APDS9960 frontSensor;
-Freenove_ESP32_WS2812 strip = Freenove_ESP32_WS2812(1, ledPin);
+CRGB leds[NUM_LEDS];
 WiFiUDP udp;
 ICM_20948_I2C imu;
 
+// Estructura para control no bloqueante de LEDs
+struct LedController {
+  enum State { OFF, SOLID, BLINKING };
+  State currentState = OFF;
+  uint8_t red = 0, green = 0, blue = 0, brightness = 0;
+  unsigned long lastUpdate = 0, interval = 500;
+  bool blinkState = false;
+  
+  void update() {
+    unsigned long now = millis();
+    switch (currentState) {
+      case OFF:
+        if (brightness != 0) { brightness = 0; FastLED.setBrightness(0); FastLED.show(); }
+      break;
+      case SOLID:
+        if (now - lastUpdate > 50) { leds[0] = CRGB(red, green, blue); FastLED.setBrightness(brightness); FastLED.show(); lastUpdate = now; }
+        break;
+      case BLINKING:
+        if (now - lastUpdate >= interval) { blinkState = !blinkState; if (blinkState) { leds[0] = CRGB(red, green, blue); FastLED.setBrightness(brightness); } else { FastLED.setBrightness(0); } FastLED.show(); lastUpdate = now; }
+        break;
+    }
+  }
+  
+  void setSolid(uint8_t r, uint8_t g, uint8_t b, uint8_t bright = 255) { red = r; green = g; blue = b; brightness = bright; currentState = SOLID; }
+  void setBlink(uint8_t r, uint8_t g, uint8_t b, uint8_t bright = 255, unsigned long intervalMs = 250) { red = r; green = g; blue = b; brightness = bright; interval = intervalMs; currentState = BLINKING; lastUpdate = 0; }
+  void setOff() { currentState = OFF; }
+};
+
+LedController ledCtrl;
 
 /*****************************************************************************************
 
@@ -260,6 +327,133 @@ void LowBattery() {
   }
 }
 
+/***************************************************************************************
+
+  Función para iniciar el barrido continuo del servo (ángulo de 0 a 180 grados). 
+
+**************************************************************************************/
+void startContinuousServoSweep(int startAngle = 0, int endAngle = 180, int stepSize = 5, int delayMs = 20) {
+  servoCtrl.startAngle = constrain(startAngle, 0, 180);
+  servoCtrl.endAngle = constrain(endAngle, 0, 180);
+  servoCtrl.stepSize = constrain(abs(stepSize), 1, 45);
+  servoCtrl.delayMs = constrain(delayMs, 5, 100);  
+  
+  servoCtrl.currentAngle = servoCtrl.startAngle;
+  servoCtrl.direction = (servoCtrl.endAngle > servoCtrl.startAngle) ? 1 : -1;
+  
+  servoCtrl.state = ServoController::SWEEPING_CONTINUOUS;
+  servoCtrl.sweepActive = true;
+  servoCtrl.lastMoveTime = millis();
+  
+  frontServo.write(servoCtrl.currentAngle);
+}
+
+/***************************************************************************************
+
+  Función para actualizar el barrido continuo del servo. Esta función se llama periódicamente
+  y mueve el servo al siguiente ángulo según la dirección y el paso definidos. Si alcanza 
+  los límites, cambia la dirección del barrido.
+
+**************************************************************************************/
+void updateServoSweep() {
+  if (servoCtrl.state != ServoController::SWEEPING_CONTINUOUS) {
+    return;
+  }
+  
+  unsigned long currentTime = millis();
+  if (currentTime - servoCtrl.lastMoveTime < servoCtrl.delayMs) {
+    return; 
+  }
+  
+  
+  servoCtrl.currentAngle += servoCtrl.direction * servoCtrl.stepSize;
+  
+  
+  if (servoCtrl.currentAngle >= servoCtrl.endAngle) {
+    servoCtrl.currentAngle = servoCtrl.endAngle;
+    servoCtrl.direction = -1;  
+  } else if (servoCtrl.currentAngle <= servoCtrl.startAngle) {
+    servoCtrl.currentAngle = servoCtrl.startAngle;
+    servoCtrl.direction = 1;   
+  }
+  
+  frontServo.write(servoCtrl.currentAngle);
+  servoCtrl.lastMoveTime = currentTime;
+}
+
+/***************************************************************************************
+
+  Función para verificar si el barrido del servo está activo y en estado de barrido continuo.  
+
+**************************************************************************************/
+bool isServoSweepActive() {
+  return servoCtrl.sweepActive && (servoCtrl.state == ServoController::SWEEPING_CONTINUOUS);
+}
+
+/***************************************************************************************
+  Función para detener el barrido del servo y restablecer su estado a inactivo.
+**************************************************************************************/
+void stopServoSweep() {
+  servoCtrl.state = ServoController::IDLE;
+  servoCtrl.sweepActive = false;
+}
+
+/***************************************************************************************
+
+Función que realiza un escaneo dirigido con el servo y el sensor frontal para detectar 
+obstáculos y determinar la mejor dirección para evadirlos. La función mueve el servo a 
+tres ángulos predefinidos
+
+**************************************************************************************/
+bool performDirectedScan() {
+    static unsigned long scanStartTime = 0;
+    static int scanDirection = 0; // 0=izquierda, 1=centro, 2=derecha
+    
+    if (scanStartTime == 0) {
+        scanStartTime = millis();
+        scanDirection = 0;
+        bestDirection = 0;
+        maxDetectedDistance = 0;
+        frontServo.write(scanAngles[0]); 
+        return false;
+    }
+    
+    
+    if (millis() - scanStartTime < 500) {
+        return false;
+    }
+    
+    
+    int currentDistance = frontSensor.readProximity();
+    MessageDebugf("DEBUG: Ángulo %d, Distancia: %d", scanAngles[scanDirection], currentDistance);
+    
+    if (currentDistance > maxDetectedDistance) {
+        maxDetectedDistance = currentDistance;
+        if (scanDirection == 0) bestDirection = -1; // Izquierda
+        else if (scanDirection == 2) bestDirection = 1; // Derecha
+    }
+    
+    
+    scanDirection++;
+    if (scanDirection < 3) {
+        frontServo.write(scanAngles[scanDirection]);
+        scanStartTime = millis();
+        return false;
+    }
+    
+    // Escaneo completado
+    frontServo.write(90); 
+    scanStartTime = 0;
+    MessageDebugf("DEBUG: Max distancia: %d, Umbral: %d, Dirección: %d", maxDetectedDistance, minClearDistance, bestDirection);
+    
+    
+    if (maxDetectedDistance < minClearDistance) {
+        bestDirection = -1; 
+    }
+    
+    return true; 
+}
+
 
 /***************************************************************************************
 
@@ -274,22 +468,32 @@ void setup() {
     Serial.begin(115200);
   #endif
 
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  
+  frontServo.setPeriodHertz(50);
+  frontServo.attach(frontServoPin, 1000, 2000);
+  frontServo.write(90);  
+  delay(100); 
+
   analogWriteFrequency(pwmFrequency);
   analogWriteResolution(pwmResolution);
 
   WiFi.begin(ssid, password);
-  strip.begin();
-  WiFiStatus();
+
+  FastLED.addLeds<WS2812, ledPin, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(maxBrightness);
+  FastLED.setMaxRefreshRate(120); 
+  ledCtrl.setOff(); 
+
   ArduinoOTA.begin();
   udp.begin(localPort);
   DebugSerialPrintf("El servidor UDP se inició en el puerto: %u\n", localPort);
   Wire.begin();
   Wire.setClock(400000);
   // setupIMU();
-
-  frontServo.attach(frontServoPin);
-  frontServo.write(90);
-  delay(500);
 
   pinMode(leftEncoderC1, INPUT_PULLUP);
   pinMode(leftEncoderC2, INPUT_PULLUP);
@@ -336,9 +540,14 @@ void setup() {
 
 ***************************************************************************************/
 void loop() {
+  ledCtrl.update(); 
   WiFiStatus();
+   if (WiFi.status() != WL_CONNECTED) return;
   ReadUdpPackets();
   ReadSensors();
+  updateServoSweep();
+  // Descomentar solo en caso de prueba rapidas
+  // ReadSerialCommands();
 
   switch (state) {
     case WAIT: {
@@ -479,6 +688,209 @@ void loop() {
 
       break;
     }
+    
+    case ACTIVE_EVASION: {
+      switch (evasionStep) {
+          case 1: { 
+
+            if (performDirectedScan()) {
+              
+              if (bestDirection == 0) {
+                
+                originalMoveDistance = 0.0;
+                originalLeftDistance = 0.0;
+                originalRightDistance = 0.0;
+                evasionStep = 0;
+                evasionStep = 0;
+                state = REVERSE;
+                ResetPID();
+                MessageDebugf("DEBUG: -1, ID: %s, Estoy aqui en bestd=0", robotID);
+              } else {
+                evasionStep = 2; // Continuar con maniobra
+                ResetPID();
+                MessageDebugf("DEBUG: -1, ID: %s, Evasión completada, continuando movimiento", robotID);
+              }
+            }
+            break;
+          }
+          
+          case 2: { // Giro inicial hacia lado libre
+            float turnAngle = (bestDirection == -1) ? -45 : 45; // Grados
+            float turnDistance = radians(abs(turnAngle)) * centerToWheelDistance;
+            
+            movementReady = MoveDistanceByWheel(turnDistance * bestDirection, -turnDistance * bestDirection);
+            
+            if (movementReady) {
+              evasionStep = 3;
+              ResetPID();
+            }
+            break;
+          }
+          
+          case 3: { // Avance lateral
+              movementReady = MoveDistanceByWheel(evasionDistance, evasionDistance);
+              
+              if (movementReady) {
+                evasionStep = 4;
+                ResetPID();
+              }
+              break;
+          }
+          
+          case 4: { // Giro de vuelta al rumbo original
+            float turnAngle = (bestDirection == -1) ? 45 : -45; // Grados (inverso al paso 2)
+            float turnDistance = radians(abs(turnAngle)) * centerToWheelDistance;
+            
+            movementReady = MoveDistanceByWheel(turnDistance * (bestDirection * -1), -turnDistance * (bestDirection * -1));
+            
+            if (movementReady) {
+              evasionStep = 5;
+              ResetPID();
+            }
+            break;
+          }
+          
+          case 5: { // Avance para sobrepasar obstáculo
+              movementReady = MoveDistanceByWheel(evasionDistance, evasionDistance);
+              
+              if (movementReady) {
+                evasionStep = 6;
+                ResetPID();
+              }
+              break;
+          }
+          
+          case 6: { // Giro para volver a trayectoria original
+            float turnAngle = (bestDirection == -1) ? 45 : -45; // Grados (inverso al paso 2)
+            float turnDistance = radians(abs(turnAngle)) * centerToWheelDistance;
+            
+            movementReady = MoveDistanceByWheel(turnDistance * (bestDirection * -1), -turnDistance * (bestDirection * -1));
+            
+            if (movementReady) {
+              evasionStep = 7;
+              ResetPID();
+            }
+            break;
+          }
+
+          case 7: {
+            movementReady = MoveDistanceByWheel(evasionDistance, evasionDistance);
+              
+              if (movementReady) {
+                evasionStep = 8;
+                ResetPID();
+              }
+            
+            break;            
+          }
+
+          case 8: { // Giro inicial hacia lado libre
+            float turnAngle = (bestDirection == -1) ? -45 : 45; // Grados
+            float turnDistance = radians(abs(turnAngle)) * centerToWheelDistance;
+            
+            movementReady = MoveDistanceByWheel(turnDistance * bestDirection, -turnDistance * bestDirection);
+            
+            if (movementReady) {
+              evasionStep = 9;
+              ResetPID();
+            }
+            break;
+          }
+          
+          case 9: { // Continuar con movimiento original restante
+            if (originalMoveDistance > 10) { // Si queda distancia significativa
+              instructionValue = originalMoveDistance;
+              state = MOVE;
+              evasionStep = 0;
+              MessageDebugf("DEBUG: -1, ID: %s, Evasión completada, continuando movimiento", robotID);
+            } else {
+              // Movimiento prácticamente completado
+              state = STOP;
+              evasionStep = 0;
+              MessageDebugf("DEBUG: -1, ID: %s, Evasión completada, movimiento terminado", robotID);
+            }
+            break;
+          }
+      }
+      
+      // Verificar si aparecen nuevos obstáculos durante evasión
+      if (evasionStep >= 5 && (leftObstacle || centralObstacle || rightObstacle)) {
+        // Abortar evasión activa, usar comportamiento original
+        state = REVERSE;
+        evasionStep = 0;
+        MessageDebugf("DEBUG: -1, ID: %s, Evasión abortada por nuevos obstáculos", robotID);
+      }
+      
+      break;
+    }
+  }
+}
+
+/***************************************************************************************
+
+Funcion selector del color del strip LED. 
+
+**************************************************************************************/
+void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
+  ledCtrl.setSolid(red, green, blue, maxBrightness);
+}
+/***************************************************************************************
+
+  Función para establecer el brillo del strip LED. 
+  
+  Esta función ajusta el brillo de los LEDs y actualiza la visualización.
+  
+  @param brightness El valor de brillo a establecer (0-255).
+
+**************************************************************************************/
+void setLedBrightness(uint8_t brightness) {
+  ledCtrl.brightness = brightness;
+  if (brightness == 0) ledCtrl.setOff();
+  else ledCtrl.currentState = LedController::SOLID;
+}
+
+void setLedBlink(uint8_t red, uint8_t green, uint8_t blue, unsigned long intervalMs = 250) {
+  ledCtrl.setBlink(red, green, blue, maxBrightness, intervalMs);
+}
+/***************************************************************************************
+
+  Función que lee los comandos enviados por el puerto serial y los procesa. 
+  Los comandos pueden ser "MOVE|valor", "TURN|valor" o "STOP". Dependiendo del comando, 
+  se actualiza la lista de instrucciones del robot y se envían mensajes de confirmación 
+  al puerto serial. Es solo de prueba y no se usa en el robot.
+
+***************************************************************************************/
+void ReadSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readString();
+    command.trim();
+    
+    int separatorIndex = command.indexOf('|');
+    String cmd = command.substring(0, separatorIndex);
+    String valueStr = command.substring(separatorIndex + 1);
+    int value = valueStr.toInt();
+    
+    if (cmd == "MOVE") {
+      fsmInstruction[0] = MOVE;
+      fsmInstruction[1] = value;
+      instructionList.push_back(fsmInstruction);
+      Serial.printf("Comando MOVE %d mm agregado\n", value);
+      
+    } else if (cmd == "TURN") {
+      fsmInstruction[0] = TURN;
+      fsmInstruction[1] = radians(value) * centerToWheelDistance;
+      instructionList.push_back(fsmInstruction);
+      Serial.printf("Comando TURN %d grados agregado\n", value);
+      
+    } else if (cmd == "STOP") {
+      instructionList.clear();
+      ConfigureHBridge(0, 0);
+      state = STOP;
+      Serial.println("Robot detenido");
+      
+    } else {
+      Serial.println("Comandos: MOVE|valor, TURN|valor, STOP");
+    }
   }
 }
 
@@ -491,14 +903,17 @@ void loop() {
 
 ***************************************************************************************/
 void WiFiStatus() {
-  while (WiFi.status() != WL_CONNECTED) {
-    ConfigureHBridge(0, 0);
-    DebugSerialPrintln("Conectando WiFi ...");
-    for (int brillo : { maxBrightness, 0 }) {
-      strip.setBrightness(brillo);
-      strip.setAllLedsColor(strip.Wheel(170));
-      delay(250);
+  if (WiFi.status() != WL_CONNECTED) {
+    static bool wifiConnecting = false;
+    if (!wifiConnecting) {
+      ConfigureHBridge(0, 0);
+      DebugSerialPrintln("Conectando WiFi ...");
+      ledCtrl.setBlink(0, 255, 255, maxBrightness, 250); // Cian parpadeante
+      wifiConnecting = true;
     }
+    return;
+  } else {
+    ledCtrl.setOff();
   }
 }
 
@@ -512,13 +927,22 @@ void WiFiStatus() {
 
 ***************************************************************************************/
 void SetupFrontSensor() {
-  while (!frontSensor.begin()) {
-    DebugSerialPrintln("Fallo la inialización del sensor APDS-9960.");
-    for (int brillo : { maxBrightness, 0 }) {
-      strip.setBrightness(brillo);
-      strip.setAllLedsColor(strip.Wheel(0));
-      delay(250);
-    }
+  static bool sensorInitialized = false;
+  static unsigned long lastAttempt = 0;
+  
+  if (sensorInitialized) return;
+  
+  unsigned long now = millis();
+  if (now - lastAttempt < 100) return;
+  
+  lastAttempt = now;
+  if (frontSensor.begin()) {
+    sensorInitialized = true;
+    ledCtrl.setOff();
+    DebugSerialPrintln("Sensor APDS-9960 inicializado correctamente");
+  } else {
+    DebugSerialPrintln("Fallo la inicialización del sensor APDS-9960.");
+    ledCtrl.setBlink(255, 0, 0, maxBrightness, 250);
   }
 }
 
@@ -541,9 +965,7 @@ void CommunicationTest(){
       }
     }
   } else {
-    strip.setBrightness(255);
-    strip.setAllLedsColor(strip.Wheel(0));
-    delay(500);
+    ledCtrl.setSolid(255, 0, 0, 255); // Rojo sólido
   }
 }
 
@@ -732,9 +1154,8 @@ void ReadUdpPackets() {
   } else if (command == "SERVO") {
     int servoAngle = constrain(arguments[1].toInt(), 5, 175);
     DebugSerialPrintf("Servo: %d°\n", servoAngle);
-    frontServo.write(servoAngle);
-
-  } else if (command == "PID") {
+    frontServo.write(servoAngle);}
+   else if (command == "PID") {
     float kp = arguments[1].toFloat();
     float ki = arguments[2].toFloat();
     float kd = arguments[3].toFloat();
@@ -844,16 +1265,13 @@ void ReadSensors() {
 
   if (debugUdp == 3) {
     if (leftObstacle || centralObstacle || rightObstacle) {
-      strip.setBrightness(maxBrightness);
-      strip.setAllLedsColor(strip.Wheel(200));
+      ledCtrl.setSolid(255, 128, 0, maxBrightness); // Naranja
     } else {
-      strip.setBrightness(0);
-      strip.setAllLedsColor(strip.Wheel(200));
+      ledCtrl.setOff();
     }
   } else {
     if ((digitalRead(batteryStatus) == LOW) && ((millis() - lowBatteryTime) >= minLowBatteryTime)) {
-      strip.setBrightness(255);
-      strip.setAllLedsColor(strip.Wheel(120));
+      ledCtrl.setSolid(255, 255, 0, 255); // Amarillo
     }
   }
 }
@@ -1127,11 +1545,7 @@ void setupIMU() {
     imu.begin(Wire, AD0_VAL);
     if (imu.status != ICM_20948_Stat_Ok) {
       DebugSerialPrintln("Fallo inicializando la IMU, provando de nuevo...");
-      for (int brillo : { maxBrightness, 0 }) {
-        strip.setBrightness(brillo);
-        strip.setAllLedsColor(strip.Wheel(85));
-        delay(250);
-      }
+      ledCtrl.setSolid(255, 0, 0, maxBrightness);
     } else {
       success = true;
     }
@@ -1153,14 +1567,12 @@ void setupIMU() {
   if (!success) {
     DebugSerialPrintln("Fallo la inicializacion del DPM.");
     DebugSerialPrintln("Verifique que la linea 29 (#define ICM_20948_USE_DMP) de ICM_20948_C.h este sin comentar.");
-    strip.setBrightness(maxBrightness);
-    strip.setAllLedsColor(strip.Wheel(85));
+    ledCtrl.setSolid(0, 255, 0, maxBrightness); // Verde sólido para error DMP
   }
 
   if (!EEPROM.begin(128)) {
     DebugSerialPrintln("Fallo la inicializacion de la EEPROM.");
-    strip.setBrightness(maxBrightness);
-    strip.setAllLedsColor(strip.Wheel(0));
+    ledCtrl.setSolid(255, 0, 0, maxBrightness); // Rojo sólido para error EEPROM
   }
 
   EEPROM.get(0, store);
@@ -1177,13 +1589,13 @@ void setupIMU() {
 
     if (!success) {
       DebugSerialPrintln("No se pudo restaurar la calibracion de la IMU.");
-      strip.setBrightness(maxBrightness);
-      strip.setAllLedsColor(strip.Wheel(0));
+      //setLedBrightness(maxBrightness);
+      //setLedColor(0, 255, 0); // Verde
     }
   } else {
     DebugSerialPrintln("No se encontro una calibracion valida para la IMU.");
-    strip.setBrightness(maxBrightness);
-    strip.setAllLedsColor(strip.Wheel(0));
+    //setLedBrightness(maxBrightness);
+    //setLedColor(255, 0, 0); // Rojo
   }
 }
 
