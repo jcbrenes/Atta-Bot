@@ -1,6 +1,7 @@
 import cv2, json, math, time, socket, threading, os, csv, multiprocessing, threading
 import numpy as np
 from datetime import datetime
+from swarm_congregation import integrate_congregation_system
 
 
 def runOnThread(func):
@@ -1469,8 +1470,12 @@ def main():
     """
     configurationFilePath = 'configSystem.json'
     base.numRobots = int(input('Cantidad de robots en la prueba: '))
-
+    
     base.readConfigFile(configurationFilePath)
+    
+    # Integrar sistema de congregación
+    congregation_system = integrate_congregation_system(base)
+    
     base.cameraProcessing()
     
 

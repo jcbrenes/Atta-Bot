@@ -1,0 +1,16 @@
+.venv/
+Base/.venv/
+venv/
+env/
+Base/ConsoleLogs/
+Base/PositionLogs/
+Base/Videos/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.dist-info/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.env
