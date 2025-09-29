@@ -6,8 +6,8 @@
         "path_save_console_logs": "ConsoleLogs"
     },
     "udp_communication": {
-        "base_ip": "192.168.137.1",
-        "broadcast_ip": "192.168.137.255",
+        "base_ip": "192.168.1.100",
+        "broadcast_ip": "192.168.1.255",
         "port": 6060
     },
     "vision_system": {

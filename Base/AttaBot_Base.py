@@ -740,7 +740,7 @@ class Base(object):
         """
 
         # Inicializa la captura de video (0 es el ID de la cámara predeterminada)
-        self.camera = cv2.VideoCapture(0, cv2.CAP_DSHOW) # CAP_DSHOW, CAP_MSMF
+        self.camera = cv2.VideoCapture(2, cv2.CAP_V4L2) # CAP_DSHOW, CAP_MSMF, CAP_V4L2
         self.debugResolution = tuple(map(int, configuration['debug_resolution'].split('x')))
         width, height = map(int, configuration['camera_resolution'].split('x'))
         self.cameraResolution = (height, width)

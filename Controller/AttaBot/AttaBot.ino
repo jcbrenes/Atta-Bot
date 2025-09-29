@@ -52,9 +52,9 @@ const unsigned int localPort = 6060;
 char receivedPacket[255];
 
 // Constantes del robot empleado
-const float pulsesPerRev = 820;             // Cantidad de pulsos por revolucion
+float pulsesPerRev = 820;             // Cantidad de pulsos por revolucion
 const float wheelCircumference = PI * 44.5;  // Diametro de la rueda = 44.5mm
-const float millimetersPerPulse = wheelCircumference / (float)pulsesPerRev;
+float millimetersPerPulse = wheelCircumference / (float)pulsesPerRev;
 const float centerToWheelDistance = 41.5;  // Radio de giro del carro, es la distancia en mm entre el centro y una rueda.
 
 // Muestreo velocidad
@@ -113,26 +113,16 @@ int obstacleSensors;
 int centralDistance;
 const int reverseDistance = -40;  // mm
 
-// Constantes para la maniobra de evasión
-float originalMoveDistance = 0.0;       
-float originalLeftDistance = 0.0;       
-float originalRightDistance = 0.0;      
-int evasionStep = 0;                     
-bool scanCompleted = false;              
-int bestDirection = 0;                   
-int maxDetectedDistance = 0;             
-int currentScanIndex = 0;                
-
-const float maxLateralDistance = 100.0;  
-const int scanAngles[] = {45, 90, 135};  
-const int minClearDistance = 200;        
-const float evasionDistance = 150.0;    /
-
 
 int debugUdp = 0;
 int debugCounter = 0;
 char direction = '+';
 const char* debugMessage = "DEBUG: %d, ID: %s, Direccion: %c, val: Izq|Der, Encoder: %d|%d, Vel: %.2f|%.2f, Pwm: %d|%d, ErrorP: %.2f|%.2f, ErrorI: %.2f|%.2f, Dis: %.2f|%.2f, Tiempo: %d";
+
+// Variables para Congregacion
+String leaderID = "-1";
+bool isLeader = false;
+bool positionReceived = false;
 
 String robotID = "-1";
 std::map<String, IPAddress> robots;
@@ -146,7 +136,9 @@ enum PossibleStates { WAIT = 0,
                       RANDOM_WALK,
                       MESSAGE_BASE,
                       IDENTIFY_OBSTACLE,
-                      ACTIVE_EVASION };
+                      ACTIVE_EVASION,
+                      REQUEST_POSITION
+                      };
 
 PossibleStates state = WAIT;
 float instructionValue = 100;
@@ -182,25 +174,6 @@ pose robotPose(0, 0, 0);
 int countMessages = 0;
 int sendMessages = 0;
 
-// Estructura para controlar el estado del servo y el barrido continuo
-struct ServoController {
-  enum State {
-    IDLE,
-    SWEEPING_CONTINUOUS
-  };
-  
-  State state = IDLE;
-  int currentAngle = 90;
-  int startAngle = 0;
-  int endAngle = 180;
-  int stepSize = 5;
-  int delayMs = 50;  // Velocidad de barrido
-  unsigned long lastMoveTime = 0;
-  int direction = 1;
-  bool sweepActive = false;
-};
-
-ServoController servoCtrl;
 Servo frontServo;
 Adafruit_APDS9960 frontSensor;
 CRGB leds[NUM_LEDS];
@@ -327,132 +300,59 @@ void LowBattery() {
   }
 }
 
+
 /***************************************************************************************
 
-  Función para iniciar el barrido continuo del servo (ángulo de 0 a 180 grados). 
 
 **************************************************************************************/
-void startContinuousServoSweep(int startAngle = 0, int endAngle = 180, int stepSize = 5, int delayMs = 20) {
-  servoCtrl.startAngle = constrain(startAngle, 0, 180);
-  servoCtrl.endAngle = constrain(endAngle, 0, 180);
-  servoCtrl.stepSize = constrain(abs(stepSize), 1, 45);
-  servoCtrl.delayMs = constrain(delayMs, 5, 100);  
-  
-  servoCtrl.currentAngle = servoCtrl.startAngle;
-  servoCtrl.direction = (servoCtrl.endAngle > servoCtrl.startAngle) ? 1 : -1;
-  
-  servoCtrl.state = ServoController::SWEEPING_CONTINUOUS;
-  servoCtrl.sweepActive = true;
-  servoCtrl.lastMoveTime = millis();
-  
-  frontServo.write(servoCtrl.currentAngle);
+void updateMillimetersPerPulse() {
+  millimetersPerPulse = wheelCircumference / pulsesPerRev;
 }
 
 /***************************************************************************************
 
-  Función para actualizar el barrido continuo del servo. Esta función se llama periódicamente
-  y mueve el servo al siguiente ángulo según la dirección y el paso definidos. Si alcanza 
-  los límites, cambia la dirección del barrido.
+ Función que calcula el vector de movimiento hacia el líder durante la congregación.
+ Determina el ángulo y distancia necesarios para llegar a la posición del líder y 
+ agrega las instrucciones correspondientes (giro y movimiento) a la cola de instrucciones.
 
-**************************************************************************************/
-void updateServoSweep() {
-  if (servoCtrl.state != ServoController::SWEEPING_CONTINUOUS) {
-    return;
-  }
-  
-  unsigned long currentTime = millis();
-  if (currentTime - servoCtrl.lastMoveTime < servoCtrl.delayMs) {
-    return; 
-  }
-  
-  
-  servoCtrl.currentAngle += servoCtrl.direction * servoCtrl.stepSize;
-  
-  
-  if (servoCtrl.currentAngle >= servoCtrl.endAngle) {
-    servoCtrl.currentAngle = servoCtrl.endAngle;
-    servoCtrl.direction = -1;  
-  } else if (servoCtrl.currentAngle <= servoCtrl.startAngle) {
-    servoCtrl.currentAngle = servoCtrl.startAngle;
-    servoCtrl.direction = 1;   
-  }
-  
-  frontServo.write(servoCtrl.currentAngle);
-  servoCtrl.lastMoveTime = currentTime;
+ @param targetX Coordenada X del líder (objetivo)
+ @param targetY Coordenada Y del líder (objetivo)
+
+***************************************************************************************/
+void CalculateAndQueueMovement(float targetX, float targetY) {
+    // Calcular vector hacia el líder
+    float deltaX = targetX - robotPose.x;
+    float deltaY = targetY - robotPose.y;
+    float distance = sqrt(deltaX * deltaX + deltaY * deltaY);
+    float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
+    
+    // Calcular giro necesario
+    float angleDiff = targetAngle - robotPose.angle;
+    
+    // Normalizar ángulo (-180 a 180)
+    while (angleDiff > 180) angleDiff -= 360;
+    while (angleDiff < -180) angleDiff += 360;
+    
+    MessageDebugf("DEBUG: -1, ID: %s, Vector calculado: dist=%.1fmm, angulo=%.1f°", 
+                  robotID, distance, angleDiff);
+    
+    // Agregar giro si es necesario (umbral de 5 grados)
+    if (abs(angleDiff) > 5) {
+        fsmInstruction[0] = TURN;
+        fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
+        instructionList.push_back(fsmInstruction);
+    }
+    
+    // Agregar movimiento hacia líder (dejar margen de 80mm)
+    if (distance > 80) {
+        fsmInstruction[0] = MOVE;
+        fsmInstruction[1] = distance - 80;
+        instructionList.push_back(fsmInstruction);
+    }
+    
+    MessageDebugf("DEBUG: -1, ID: %s, Instrucciones agregadas para congregación", robotID);
 }
 
-/***************************************************************************************
-
-  Función para verificar si el barrido del servo está activo y en estado de barrido continuo.  
-
-**************************************************************************************/
-bool isServoSweepActive() {
-  return servoCtrl.sweepActive && (servoCtrl.state == ServoController::SWEEPING_CONTINUOUS);
-}
-
-/***************************************************************************************
-  Función para detener el barrido del servo y restablecer su estado a inactivo.
-**************************************************************************************/
-void stopServoSweep() {
-  servoCtrl.state = ServoController::IDLE;
-  servoCtrl.sweepActive = false;
-}
-
-/***************************************************************************************
-
-Función que realiza un escaneo dirigido con el servo y el sensor frontal para detectar 
-obstáculos y determinar la mejor dirección para evadirlos. La función mueve el servo a 
-tres ángulos predefinidos
-
-**************************************************************************************/
-bool performDirectedScan() {
-    static unsigned long scanStartTime = 0;
-    static int scanDirection = 0; // 0=izquierda, 1=centro, 2=derecha
-    
-    if (scanStartTime == 0) {
-        scanStartTime = millis();
-        scanDirection = 0;
-        bestDirection = 0;
-        maxDetectedDistance = 0;
-        frontServo.write(scanAngles[0]); 
-        return false;
-    }
-    
-    
-    if (millis() - scanStartTime < 500) {
-        return false;
-    }
-    
-    
-    int currentDistance = frontSensor.readProximity();
-    MessageDebugf("DEBUG: Ángulo %d, Distancia: %d", scanAngles[scanDirection], currentDistance);
-    
-    if (currentDistance > maxDetectedDistance) {
-        maxDetectedDistance = currentDistance;
-        if (scanDirection == 0) bestDirection = -1; // Izquierda
-        else if (scanDirection == 2) bestDirection = 1; // Derecha
-    }
-    
-    
-    scanDirection++;
-    if (scanDirection < 3) {
-        frontServo.write(scanAngles[scanDirection]);
-        scanStartTime = millis();
-        return false;
-    }
-    
-    // Escaneo completado
-    frontServo.write(90); 
-    scanStartTime = 0;
-    MessageDebugf("DEBUG: Max distancia: %d, Umbral: %d, Dirección: %d", maxDetectedDistance, minClearDistance, bestDirection);
-    
-    
-    if (maxDetectedDistance < minClearDistance) {
-        bestDirection = -1; 
-    }
-    
-    return true; 
-}
 
 
 /***************************************************************************************
@@ -545,7 +445,7 @@ void loop() {
    if (WiFi.status() != WL_CONNECTED) return;
   ReadUdpPackets();
   ReadSensors();
-  updateServoSweep();
+  //updateServoSweep();
   // Descomentar solo en caso de prueba rapidas
   // ReadSerialCommands();
 
@@ -690,139 +590,16 @@ void loop() {
     }
     
     case ACTIVE_EVASION: {
-      switch (evasionStep) {
-          case 1: { 
 
-            if (performDirectedScan()) {
-              
-              if (bestDirection == 0) {
-                
-                originalMoveDistance = 0.0;
-                originalLeftDistance = 0.0;
-                originalRightDistance = 0.0;
-                evasionStep = 0;
-                evasionStep = 0;
-                state = REVERSE;
-                ResetPID();
-                MessageDebugf("DEBUG: -1, ID: %s, Estoy aqui en bestd=0", robotID);
-              } else {
-                evasionStep = 2; // Continuar con maniobra
-                ResetPID();
-                MessageDebugf("DEBUG: -1, ID: %s, Evasión completada, continuando movimiento", robotID);
-              }
-            }
-            break;
-          }
-          
-          case 2: { // Giro inicial hacia lado libre
-            float turnAngle = (bestDirection == -1) ? -45 : 45; // Grados
-            float turnDistance = radians(abs(turnAngle)) * centerToWheelDistance;
-            
-            movementReady = MoveDistanceByWheel(turnDistance * bestDirection, -turnDistance * bestDirection);
-            
-            if (movementReady) {
-              evasionStep = 3;
-              ResetPID();
-            }
-            break;
-          }
-          
-          case 3: { // Avance lateral
-              movementReady = MoveDistanceByWheel(evasionDistance, evasionDistance);
-              
-              if (movementReady) {
-                evasionStep = 4;
-                ResetPID();
-              }
-              break;
-          }
-          
-          case 4: { // Giro de vuelta al rumbo original
-            float turnAngle = (bestDirection == -1) ? 45 : -45; // Grados (inverso al paso 2)
-            float turnDistance = radians(abs(turnAngle)) * centerToWheelDistance;
-            
-            movementReady = MoveDistanceByWheel(turnDistance * (bestDirection * -1), -turnDistance * (bestDirection * -1));
-            
-            if (movementReady) {
-              evasionStep = 5;
-              ResetPID();
-            }
-            break;
-          }
-          
-          case 5: { // Avance para sobrepasar obstáculo
-              movementReady = MoveDistanceByWheel(evasionDistance, evasionDistance);
-              
-              if (movementReady) {
-                evasionStep = 6;
-                ResetPID();
-              }
-              break;
-          }
-          
-          case 6: { // Giro para volver a trayectoria original
-            float turnAngle = (bestDirection == -1) ? 45 : -45; // Grados (inverso al paso 2)
-            float turnDistance = radians(abs(turnAngle)) * centerToWheelDistance;
-            
-            movementReady = MoveDistanceByWheel(turnDistance * (bestDirection * -1), -turnDistance * (bestDirection * -1));
-            
-            if (movementReady) {
-              evasionStep = 7;
-              ResetPID();
-            }
-            break;
-          }
-
-          case 7: {
-            movementReady = MoveDistanceByWheel(evasionDistance, evasionDistance);
-              
-              if (movementReady) {
-                evasionStep = 8;
-                ResetPID();
-              }
-            
-            break;            
-          }
-
-          case 8: { // Giro inicial hacia lado libre
-            float turnAngle = (bestDirection == -1) ? -45 : 45; // Grados
-            float turnDistance = radians(abs(turnAngle)) * centerToWheelDistance;
-            
-            movementReady = MoveDistanceByWheel(turnDistance * bestDirection, -turnDistance * bestDirection);
-            
-            if (movementReady) {
-              evasionStep = 9;
-              ResetPID();
-            }
-            break;
-          }
-          
-          case 9: { // Continuar con movimiento original restante
-            if (originalMoveDistance > 10) { // Si queda distancia significativa
-              instructionValue = originalMoveDistance;
-              state = MOVE;
-              evasionStep = 0;
-              MessageDebugf("DEBUG: -1, ID: %s, Evasión completada, continuando movimiento", robotID);
-            } else {
-              // Movimiento prácticamente completado
-              state = STOP;
-              evasionStep = 0;
-              MessageDebugf("DEBUG: -1, ID: %s, Evasión completada, movimiento terminado", robotID);
-            }
-            break;
-          }
-      }
-      
-      // Verificar si aparecen nuevos obstáculos durante evasión
-      if (evasionStep >= 5 && (leftObstacle || centralObstacle || rightObstacle)) {
-        // Abortar evasión activa, usar comportamiento original
-        state = REVERSE;
-        evasionStep = 0;
-        MessageDebugf("DEBUG: -1, ID: %s, Evasión abortada por nuevos obstáculos", robotID);
-      }
-      
       break;
     }
+
+    case REQUEST_POSITION: {
+      SendMessage(robots["Base"], "REQUEST_POSITION");
+      MessageDebugf("DEBUG: -1, ID: %s, Solicitud de posicion enviada a la base", robotID);
+      state = WAIT;
+      instructionValue = 2000;
+      break;
   }
 }
 
@@ -1154,8 +931,9 @@ void ReadUdpPackets() {
   } else if (command == "SERVO") {
     int servoAngle = constrain(arguments[1].toInt(), 5, 175);
     DebugSerialPrintf("Servo: %d°\n", servoAngle);
-    frontServo.write(servoAngle);}
-   else if (command == "PID") {
+    frontServo.write(servoAngle);
+    
+  } else if (command == "PID") {
     float kp = arguments[1].toFloat();
     float ki = arguments[2].toFloat();
     float kd = arguments[3].toFloat();
@@ -1186,6 +964,16 @@ void ReadUdpPackets() {
     robotPose.y = arguments[2].toFloat();
     robotPose.angle = arguments[3].toFloat();
 
+  } else if (command == "SETPPR") {
+    float newPPR = arguments[1].toFloat();
+    if (newPPR > 100 && newPPR < 5000) {
+      pulsesPerRev = newPPR;
+      updateMillimetersPerPulse();
+      SendMessage(robots["Base"], "Pulsos por revolucion modificado");
+    } else {
+      SendMessage(robots["Base"], "Error: PPR debe estar entre 100-5000");
+    }
+    
   } else if (command == "CHECK_OBSTACLE") {
     int sensors = arguments[1].toInt();
     float x = arguments[2].toFloat();
@@ -1219,10 +1007,58 @@ void ReadUdpPackets() {
     char buffer[50];
     snprintf(buffer, sizeof(buffer), "Robot ID: %s, Total messages: %d", robotID, countMessages);
     SendMessage(robots["Base"], buffer);
+
+  } else if (command == "CONGREGATION") {
+    leaderID = arguments[1];
+    isLeader = (robotID == leaderID);
+    positionReceived = false;
+    
+    MessageDebugf("DEBUG: -1, ID: %s, Congregación iniciada. Líder: %s", robotID, leaderID);
+    
+    // Solicitud escalonada basada en ID (200ms por robot)
+    int delay = robotID.toInt() * 200;
+    fsmInstruction[0] = WAIT;
+    fsmInstruction[1] = delay;
+    instructionList.push_back(fsmInstruction);
+    
+    // Después del delay, cambiar a estado de solicitud
+    fsmInstruction[0] = REQUEST_POSITION;
+    fsmInstruction[1] = 0;
+    instructionList.push_back(fsmInstruction);
+
+  } else if (command == "POSITION_RESPONSE") {
+    robotPose.x = arguments[1].toFloat();
+    robotPose.y = arguments[2].toFloat();
+    robotPose.angle = arguments[3].toFloat();
+    positionReceived = true;
+    
+    MessageDebugf("DEBUG: -1, ID: %s, Posición recibida: %.1f,%.1f,%.1f", 
+                  robotID, robotPose.x, robotPose.y, robotPose.angle);
+    
+    if (isLeader) {
+        // El líder broadcastea su posición
+        char buffer[60];
+        snprintf(buffer, sizeof(buffer), "LEADER_POSITION|%s|%.1f|%.1f|%.1f", 
+                robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
+        SendMessage(robots["Broadcast"], buffer);
+        MessageDebugf("DEBUG: -1, ID: %s, Enviando posición como líder", robotID);
+    }
+
+  } else if (command == "LEADER_POSITION") {
+    String receivedLeaderID = arguments[1];
+    
+    if (!isLeader && receivedLeaderID == leaderID && positionReceived) {
+        float leaderX = arguments[2].toFloat();
+        float leaderY = arguments[3].toFloat();
+        
+        MessageDebugf("DEBUG: -1, ID: %s, Recibida posición del líder %s: %.1f,%.1f", 
+                      robotID, receivedLeaderID, leaderX, leaderY);
+        
+        CalculateAndQueueMovement(leaderX, leaderY);
+    }
   }
+
 }
-
-
 /***************************************************************************************
 
  Función que lee el estado de los sensores de proximidad y la batería. En cada ciclo, 
