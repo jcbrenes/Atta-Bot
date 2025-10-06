@@ -20,20 +20,8 @@ class CongregationSystem:
         self.base = base
         self.congregation_active = False
         self.current_leader_id = None
-        self.pending_position_requests = set()
-        self.congregation_thread = None
-        
-        # Mapeo de IPs a IDs de robots - se actualiza automáticamente
-        self.ip_to_robot_id = {}
         
         print("Sistema de congregación inicializado")
-    
-    def update_ip_mapping(self):
-        """
-        Actualiza el mapeo de IPs a IDs de robots basándose en los robots detectados.
-        """
-        self.ip_to_robot_id = {robot.IP: robot.id for robot in self.base.robots.values()}
-        print(f"Mapeo IP actualizado: {self.ip_to_robot_id}")
     
     def start_congregation(self, leader_id):
         """
@@ -48,10 +36,6 @@ class CongregationSystem:
         
         self.congregation_active = True
         self.current_leader_id = leader_id
-        self.pending_position_requests.clear()
-        
-        # Actualizar mapeo de IPs
-        self.update_ip_mapping()
         
         print(f"Iniciando congregación con líder: {leader_id}")
         
@@ -69,35 +53,35 @@ class CongregationSystem:
         Args:
             sender_ip (str): IP del robot que solicita su posición
         """
-        robot_id = self.ip_to_robot_id.get(sender_ip)
+        # Buscar qué robot tiene esta IP
+        requesting_robot = None
+        for robot in self.base.robots.values():
+            if robot.IP == sender_ip:
+                requesting_robot = robot
+                break
         
-        if not robot_id:
+        if not requesting_robot:
             print(f"IP no reconocida en solicitud de posición: {sender_ip}")
             return
         
-        if robot_id not in self.base.robots:
-            print(f"Robot {robot_id} no encontrado en sistema")
-            return
-        
         # Obtener posición actual del robot desde el sistema de visión
-        robot = self.base.robots[robot_id]
-        current_pose = robot.getPose()
+        current_pose = requesting_robot.getPose()
         
         if current_pose == (-1, -1, -1):
-            print(f"No se pudo obtener posición para robot {robot_id}")
-            return
+            print(f"No se pudo obtener posición para robot {requesting_robot.id}")
+            # Intentar usar la posición anterior si está disponible
+            if requesting_robot.previousPose:
+                current_pose = requesting_robot.previousPose
+            else:
+                return
         
         x, y, angle = current_pose
         
-        # Enviar respuesta con posición
+        # Enviar respuesta con posición directamente a la IP del robot
         response = f"POSITION_RESPONSE|{x}|{y}|{angle}"
         self.base.sendInstruction(sender_ip, [response], False)
         
-        print(f"Posición enviada a robot {robot_id}: {x}, {y}, {angle}")
-        
-        # Marcar como atendido
-        if robot_id in self.pending_position_requests:
-            self.pending_position_requests.remove(robot_id)
+        print(f"Posición enviada a robot {requesting_robot.id} ({requesting_robot.name}): {x}, {y}, {angle}")
     
     def handle_congregation_message(self, message, sender_ip):
         """
@@ -121,23 +105,43 @@ class CongregationSystem:
             return True
             
         elif command == "COORDS_RECEIVED":
-            robot_id = self.ip_to_robot_id.get(sender_ip, "unknown")
-            print(f"Robot {robot_id} confirmó recepción de coordenadas")
+            # Buscar robot por IP
+            robot = self.find_robot_by_ip(sender_ip)
+            robot_name = robot.name if robot else "unknown"
+            print(f"Robot {robot_name} confirmó recepción de coordenadas")
             return True
             
         elif command == "ALL_MOVEMENTS_COMPLETE":
-            robot_id = self.ip_to_robot_id.get(sender_ip, "unknown")
-            print(f"Robot {robot_id} completó movimientos de congregación")
+            # Buscar robot por IP
+            robot = self.find_robot_by_ip(sender_ip)
+            robot_name = robot.name if robot else "unknown"
+            print(f"Robot {robot_name} completó movimientos de congregación")
             return True
             
         elif command == "LEADER_POSITION":
             # Los robots intercambian información de líder - solo logging
             leader_id = parts[1] if len(parts) > 1 else "unknown"
-            robot_id = self.ip_to_robot_id.get(sender_ip, "unknown")
-            print(f"Robot {robot_id} recibió posición del líder {leader_id}")
+            robot = self.find_robot_by_ip(sender_ip)
+            robot_name = robot.name if robot else "unknown"
+            print(f"Robot {robot_name} anunció posición como líder {leader_id}")
             return True
         
         return False
+    
+    def find_robot_by_ip(self, ip):
+        """
+        Busca un robot por su dirección IP.
+        
+        Args:
+            ip (str): Dirección IP del robot
+            
+        Returns:
+            Robot: Objeto robot o None si no se encuentra
+        """
+        for robot in self.base.robots.values():
+            if robot.IP == ip:
+                return robot
+        return None
     
     def stop_congregation(self):
         """
@@ -145,7 +149,6 @@ class CongregationSystem:
         """
         self.congregation_active = False
         self.current_leader_id = None
-        self.pending_position_requests.clear()
         print("Congregación detenida")
     
     def get_congregation_status(self):
@@ -158,8 +161,8 @@ class CongregationSystem:
         return {
             'active': self.congregation_active,
             'leader_id': self.current_leader_id,
-            'pending_requests': len(self.pending_position_requests),
-            'total_robots': len(self.base.robots)
+            'total_robots': len(self.base.robots),
+            'robots': {robot.id: {'name': robot.name, 'ip': robot.IP} for robot in self.base.robots.values()}
         }
 
 
@@ -175,37 +178,37 @@ def integrate_congregation_system(base):
     """
     congregation_system = CongregationSystem(base)
     
-    # Modificar el método readUdpConnection de la clase Base
-    original_readUdpConnection = base.readUdpConnection
+    # Guardar referencia al método original readUdpConnection
+    original_readUdpConnection = base.readUdpConnection.__func__
     
-    def enhanced_readUdpConnection():
+    def enhanced_readUdpConnection(self):
         """
         Versión mejorada de readUdpConnection que incluye manejo de congregación.
         """
-        base.createConcoleLog()
-        base.sock.settimeout(None)
+        self.createConcoleLog()
+        self.sock.settimeout(None)
         
         while True:
             try:
-                data, addr = base.sock.recvfrom(1024)
+                data, addr = self.sock.recvfrom(1024)
                 ip = addr[0]
                 
-                if ip != base.baseIP:
+                if ip != self.baseIP:
                     message = data.decode()
-                    timeLog = round(time.time() - base.startTime, 1)
+                    timeLog = round(time.time() - self.startTime, 1)
                     
                     # Intentar procesar mensaje de congregación primero
                     if congregation_system.handle_congregation_message(message, ip):
-                        # Mensaje de congregación procesado
+                        # Mensaje de congregación procesado, no hacer logging normal
                         continue
                     
                     # Procesamiento normal para otros mensajes
                     robot_info = next(
-                        ((robot.name, robot.id) for robot in base.robots.values() if robot.IP == ip), 
+                        ((robot.name, robot.id) for robot in self.robots.values() if robot.IP == ip), 
                         (ip, "unknown")
                     )
                     name, robot_id = robot_info
-                    base.addConcoleLog(timeLog, robot_id, name, message)
+                    self.addConcoleLog(timeLog, robot_id, name, message)
                     
                     if message.split('|')[0] == 'CHECK_OBSTACLE':
                         continue
@@ -216,23 +219,27 @@ def integrate_congregation_system(base):
                 print(f"Error en comunicación UDP: {e}")
                 break
     
-    # Reemplazar el método original con la versión mejorada
-    base.readUdpConnection = enhanced_readUdpConnection
+    # Reemplazar el método con la versión mejorada usando bound method
+    base.readUdpConnection = enhanced_readUdpConnection.__get__(base, base.__class__)
     
-    # Modificar el método inputInstruction para incluir comandos de congregación
-    original_inputInstruction = base.inputInstruction
+    # Guardar referencia al método original inputInstruction
+    original_inputInstruction = base.inputInstruction.__func__
     
-    def enhanced_inputInstruction():
+    def enhanced_inputInstruction(self):
         """
         Versión mejorada de inputInstruction que incluye comandos de congregación.
         """
-        print("Comandos disponibles:")
+        print("\n=== COMANDOS DISPONIBLES ===")
+        print("Comandos normales:")
         print("  - robotId.instrucción (ej: 1.MOVE|100)")
         print("  - BROADCAST.instrucción")
+        print("\nComandos de congregación:")
         print("  - CONGREGATION.START|leader_id (ej: CONGREGATION.START|4)")
         print("  - CONGREGATION.STOP")
         print("  - CONGREGATION.STATUS")
+        print("\nOtros:")
         print("  - BREAK (para salir)")
+        print("=============================\n")
         
         while True:
             instructionRaw = input('>> ').strip()
@@ -247,40 +254,51 @@ def integrate_congregation_system(base):
                 if command_part.startswith('START|'):
                     leader_id = command_part[6:]  # Remover 'START|'
                     if congregation_system.start_congregation(leader_id):
-                        print(f"Congregación iniciada con líder {leader_id}")
+                        print(f"✓ Congregación iniciada con líder {leader_id}")
                     else:
-                        print(f"Error al iniciar congregación con líder {leader_id}")
+                        print(f"✗ Error al iniciar congregación con líder {leader_id}")
                         
                 elif command_part == 'STOP':
                     congregation_system.stop_congregation()
-                    print("Congregación detenida")
+                    print("✓ Congregación detenida")
                     
                 elif command_part == 'STATUS':
                     status = congregation_system.get_congregation_status()
-                    print(f"Estado de congregación: {status}")
+                    print(f"\n--- ESTADO DE CONGREGACIÓN ---")
+                    print(f"Activa: {status['active']}")
+                    print(f"Líder: {status['leader_id']}")
+                    print(f"Total robots: {status['total_robots']}")
+                    if status['robots']:
+                        print("Robots disponibles:")
+                        for robot_id, robot_info in status['robots'].items():
+                            print(f"  {robot_id}: {robot_info['name']} ({robot_info['ip']})")
+                    print("------------------------------\n")
                     
                 else:
-                    print("Comando de congregación no válido")
+                    print("✗ Comando de congregación no válido")
+                    print("Comandos válidos: START|id, STOP, STATUS")
                 continue
             
             # Procesamiento normal de instrucciones
             try:
                 robotId, instruction = map(str.strip, instructionRaw.split('.', 1))
             except ValueError:
-                print("Formato inválido. Use 'robotId.instrucción' o 'CONGREGATION.comando'")
+                print("✗ Formato inválido. Use 'robotId.instrucción' o 'CONGREGATION.comando'")
                 continue
             
             if robotId == 'BROADCAST':
-                base.sendInstructionBroadcast([instruction])
-            elif robotId in base.robots:
-                robotIP = base.robots[robotId].IP
-                base.sendInstruction(robotIP, [instruction], True)
+                self.sendInstructionBroadcast([instruction])
+            elif robotId in self.robots:
+                robotIP = self.robots[robotId].IP
+                self.sendInstruction(robotIP, [instruction], True)
             else:
-                print(f"Robot ID '{robotId}' no encontrado.")
+                print(f"✗ Robot ID '{robotId}' no encontrado.")
+                available_robots = ', '.join(self.robots.keys())
+                print(f"Robots disponibles: {available_robots}")
         
-        base.threadInputAlive = False
+        self.threadInputAlive = False
     
-    # Reemplazar el método original
-    base.inputInstruction = enhanced_inputInstruction
+    # Reemplazar el método con la versión mejorada usando bound method
+    base.inputInstruction = enhanced_inputInstruction.__get__(base, base.__class__)
     
     return congregation_system

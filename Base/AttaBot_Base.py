@@ -1,7 +1,6 @@
 import cv2, json, math, time, socket, threading, os, csv, multiprocessing, threading
 import numpy as np
 from datetime import datetime
-from swarm_congregation import integrate_congregation_system
 
 
 def runOnThread(func):
@@ -558,6 +557,9 @@ class Base(object):
         self.roi = None
         self.frameQueue = None
         self.videoProcess = multiprocessing.Process()
+        self.congregationActive = False
+        self.leaderID = None 
+        self.robotPositions = {} 
 
 
     def searchRobotsColor(self, robots):
@@ -685,6 +687,38 @@ class Base(object):
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.bind(('', self.port))
 
+    """
+    def configUdp(self, configuration):
+    
+    Configura la comunicación UDP para el sistema.
+    
+
+    import socket
+
+    self.baseIP = configuration['base_ip']          # ej. 192.168.1.1 (Ethernet de tu PC)
+    self.broadcastIP = configuration['broadcast_ip'] # ej. 192.168.1.255
+    self.port = configuration['port']
+
+    # Crear socket UDP
+    self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Permitir broadcast
+    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    # Reusar puerto/dirección (necesario en Linux, seguro en Windows)
+    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except AttributeError:
+        pass  # Windows no soporta SO_REUSEPORT
+
+    # Aumentar buffer de recepción (útil si responden muchos robots a la vez)
+    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**20)
+
+    # Bind explícito a la interfaz Ethernet (no usar '' en Linux)
+    self.sock.bind((self.baseIP, self.port))
+"""
+
 
     def configVisionSystem(self, configuration):
         """
@@ -740,7 +774,7 @@ class Base(object):
         """
 
         # Inicializa la captura de video (0 es el ID de la cámara predeterminada)
-        self.camera = cv2.VideoCapture(2, cv2.CAP_V4L2) # CAP_DSHOW, CAP_MSMF, CAP_V4L2
+        self.camera = cv2.VideoCapture(2, cv2.CAP_V4L) # CAP_DSHOW, CAP_MSMF
         self.debugResolution = tuple(map(int, configuration['debug_resolution'].split('x')))
         width, height = map(int, configuration['camera_resolution'].split('x'))
         self.cameraResolution = (height, width)
@@ -1383,6 +1417,105 @@ class Base(object):
         with open(self.pathConsolelog, 'a', newline='') as f:
             csv.writer(f).writerow(row)
 
+    
+    def startCongregation(self, leaderID):
+        """
+        Inicia el proceso de congregación con un líder designado.
+        
+        Parámetros:
+        - leaderID (str): ID del robot líder
+        """
+        if leaderID not in self.robots:
+            print(f"Error: Robot líder {leaderID} no encontrado")
+            return
+        
+        self.congregationActive = True
+        self.leaderID = leaderID
+        
+        instruction = f'CONGREGATION|{leaderID}'
+        self.sendInstructionBroadcast([instruction])
+        print(f"Congregación iniciada. Líder: {self.robots[leaderID].name}")
+
+
+    def sendToGlobalPosition(self, robotID, targetX, targetY):
+        """
+        Envía un robot a una posición global específica.
+        
+        Parámetros:
+        - robotID (str): ID del robot
+        - targetX (float): Coordenada X objetivo
+        - targetY (float): Coordenada Y objetivo
+        """
+        if robotID not in self.robots:
+            print(f"Error: Robot {robotID} no encontrado")
+            return
+        
+        robot = self.robots[robotID]
+        instruction = f'POSITIONGT|{targetX}|{targetY}'
+        self.sendInstruction(robot.IP, [instruction], True)
+        print(f"Robot {robot.name} enviado a posición: x={targetX}, y={targetY}")
+
+    def updateRobotPosition(self, robotID, x, y, angle):
+        """
+        Actualiza la posición de un robot en el registro interno.
+        
+        Parámetros:
+        - robotID (str): ID del robot
+        - x (float): Coordenada X
+        - y (float): Coordenada Y  
+        - angle (float): Ángulo en grados
+        """
+        self.robotPositions[robotID] = {
+            'x': x,
+            'y': y,
+            'angle': angle,
+            'timestamp': time.time()
+        }
+
+    def getDistanceBetweenRobots(self, robotID1, robotID2):
+        """
+        Calcula la distancia euclidiana entre dos robots.
+        
+        Parámetros:
+        - robotID1 (str): ID del primer robot
+        - robotID2 (str): ID del segundo robot
+        
+        Retorna:
+        - float: Distancia en milímetros, o -1 si algún robot no existe
+        """
+        if robotID1 not in self.robots or robotID2 not in self.robots:
+            return -1
+        
+        x1, y1, _ = self.robots[robotID1].previousPose
+        x2, y2, _ = self.robots[robotID2].previousPose
+        
+        if x1 == -1 or x2 == -1:
+            return -1
+        
+        return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    
+    def isCongregationComplete(self, threshold=100):
+        """
+        Verifica si todos los robots están cerca del líder.
+        
+        Parámetros:
+        - threshold (float): Distancia máxima en mm para considerar "cerca"
+        
+        Retorna:
+        - bool: True si todos están cerca del líder
+        """
+        if not self.congregationActive or self.leaderID is None:
+            return False
+        
+        for robotID in self.robots:
+            if robotID == self.leaderID:
+                continue
+            
+            distance = self.getDistanceBetweenRobots(self.leaderID, robotID)
+            if distance == -1 or distance > threshold:
+                return False
+        
+        return True
 
     @runOnThread
     def inputInstruction(self):
@@ -1418,40 +1551,120 @@ class Base(object):
             elif robotId in self.robots:
                 robotIP = self.robots[robotId].IP
                 self.sendInstruction(robotIP, [instruction], True)
+            elif robotId == 'CONGREGATION':
+                # Formato: CONGREGATION.leaderID
+                leaderID = instruction
+                self.startCongregation(leaderID)
+
+            elif robotId == 'GOTO':
+                # Formato: GOTO.robotID x y
+                parts = instruction.split()
+                if len(parts) == 3:
+                    targetRobotID = parts[0]
+                    targetX = float(parts[1])
+                    targetY = float(parts[2])
+                    self.sendToGlobalPosition(targetRobotID, targetX, targetY)
+                else:
+                    print("Formato: GOTO.robotID x y")
+
+            elif robotId == 'STATUS':
+                # Muestra estado de congregación
+                if self.congregationActive:
+                    print(f"Congregación activa. Líder: {self.leaderID}")
+                    print(f"Completa: {self.isCongregationComplete()}")
+                else:
+                    print("No hay congregación activa")
             else:
                 print(f"Robot ID '{robotId}' no encontrado.")
-        
-        self.threadInputAlive = False
+                    
+                self.threadInputAlive = False
 
 
     @runOnThread
     def readUdpConnection(self):
         """
         Escucha y procesa mensajes recibidos a través de la conexión UDP.
-
-        Esta función establece un bucle infinito que espera recibir datos 
-        de los robots conectados a través de UDP. Cuando se recibe un 
-        mensaje, se decodifica y se registra en un archivo de log. Si el 
-        mensaje recibido es 'CHECK_OBSTACLE', se ignora y no se 
-        imprime en la consola.
-
-        Retorna:
-        - None
+        VERSIÓN EXTENDIDA con soporte para congregación.
         """
         self.createConcoleLog()
         self.sock.settimeout(None)
+        
         while True:
             data, addr = self.sock.recvfrom(1024)
             ip = addr[0]
+            
             if ip != self.baseIP:
                 message = data.decode()
                 timeLog = round(time.time() - self.startTime, 1)
-                name, id = next(((robot.name, robot.id) for robot in self.robots.values() if robot.IP == ip), ip)
+                
+                # Buscar robot por IP
+                robotFound = False
+                for robot in self.robots.values():
+                    if robot.IP == ip:
+                        name, id = robot.name, robot.id
+                        robotFound = True
+                        break
+                
+                if not robotFound:
+                    name, id = ip, "-1"
+                
                 self.addConcoleLog(timeLog, id, name, message)
-
-                if message.split('|')[0] == 'CHECK_OBSTACLE':
+                
+                # Parsear mensaje
+                parts = message.split('|')
+                command = parts[0]
+                
+                # ========== NUEVOS COMANDOS ==========
+                
+                if command == 'REQUEST_POSITION':
+                    # Robot solicita su posición actual
+                    if robotFound:
+                        self.sendPositionToRobot(ip, id)
+                        print(f"Solicitud de posición de {name}")
+                    
+                elif command == 'LEADER_POSITION':
+                    # Líder broadcast su posición para congregación
+                    if len(parts) >= 5:
+                        leaderID = parts[1]
+                        leaderX = float(parts[2])
+                        leaderY = float(parts[3])
+                        leaderAngle = float(parts[4])
+                        
+                        self.updateRobotPosition(leaderID, leaderX, leaderY, leaderAngle)
+                        print(f"Posición de líder {leaderID}: x={leaderX}, y={leaderY}, angle={leaderAngle}")
+                
+                # ========== COMANDOS EXISTENTES ==========
+                
+                elif command == 'CHECK_OBSTACLE':
                     continue
-                print(f"Mensaje de {name}: {message}")
+                    
+                else:
+                    print(f"Mensaje de {name}: {message}")
+    
+
+    @runOnThread
+    def sendPositionToRobot(self, robotIP, robotID):
+        """
+        Envía la posición actual de un robot específico.
+        
+        Parámetros:
+        - robotIP (str): Dirección IP del robot
+        - robotID (str): ID del robot que solicita posición
+        """
+        if robotID not in self.robots:
+            print(f"Robot {robotID} no encontrado")
+            return
+        
+        robot = self.robots[robotID]
+        x, y, angle = robot.previousPose
+        
+        if x == -1 and y == -1 and angle == -1:
+            print(f"Posición no disponible para robot {robotID}")
+            return
+        
+        message = f'POSITION_RESPONSE|{x}|{y}|{angle}'
+        self.sendInstruction(robotIP, [message], False)
+        print(f"Posición enviada a {robot.name}: x={x}, y={y}, angle={angle}")
 
 
 
@@ -1470,12 +1683,8 @@ def main():
     """
     configurationFilePath = 'configSystem.json'
     base.numRobots = int(input('Cantidad de robots en la prueba: '))
-    
+
     base.readConfigFile(configurationFilePath)
-    
-    # Integrar sistema de congregación
-    congregation_system = integrate_congregation_system(base)
-    
     base.cameraProcessing()
     
 
