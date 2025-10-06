@@ -25,35 +25,41 @@
         }
     },
     "colors": {
-        "magenta": {
-            "light": [145, 50, 150],
-            "dark": [180, 200, 200]
+        "verde_claro": {
+            "light": [30, 50, 50],
+            "dark": [60, 255, 255]
         },
-        "amarillo": {
-            "light": [27, 50, 50],
-            "dark": [40, 255, 255]
+        "cyan": { 
+            "light": [85, 143, 151],
+            "dark": [105, 255, 255]
         },
         "azul": {
             "light": [100, 200, 50],
             "dark": [120, 255, 200]
-        }
+        },
+        "magenta": {
+            "light": [133, 51, 184],
+            "dark": [180, 255, 255]
+        }    
+               
+        
     },
     "robots": {
         "1": {
-            "name": "Robot_Amarillo-Magenta",
-            "colors": ["amarillo", "magenta"]
+            "name": "Robot_Verde_claro-Magenta",
+            "colors": ["verde_claro", "magenta"]
         },
         "2": {
-            "name": "Robot_Magenta-Amarillo",
-            "colors": ["magenta", "amarillo"]
+            "name": "Robot_Magenta-Verde_claro",
+            "colors": ["magenta", "verde_claro"]
         },
         "3": {
-            "name": "Robot_Amarillo-Azul",
-            "colors": ["amarillo", "azul"]
+            "name": "Robot_Verde_claro-Azul",
+            "colors": ["verde_claro", "azul"]
         },
         "4": {
-            "name": "Robot_Azul-Amarillo",
-            "colors": ["azul", "amarillo"]
+            "name": "Robot_Azul-Verde_claro",
+            "colors": ["azul", "verde_claro"]
         },
         "5": {
             "name": "Robot_Magenta-Azul",
@@ -62,6 +68,30 @@
         "6": {
             "name": "Robot_Azul-Magenta",
             "colors": ["azul", "magenta"]
-        }     
-    }   
+        },   
+        "7": {
+            "name": "Robot_Cyan-Verde_claro",
+            "colors": ["cyan", "verde_claro"]
+        },
+        "8": {
+            "name": "Robot_Verde_claro-Cyan",
+            "colors": ["verde_claro", "cyan"]
+        },
+        "9": {
+            "name": "Robot_Cyan-Azul",
+            "colors": ["cyan", "azul"]
+        },
+        "10": {
+            "name": "Robot_Azul-Cyan",
+            "colors": ["azul", "cyan"]
+        },
+        "11": {
+            "name": "Robot_Cyan-Magenta",
+            "colors": ["cyan", "magenta"]
+        },
+        "12": {
+            "name": "Robot_Magenta-Cyan",
+            "colors": ["magenta", "cyan"]
+        }
+    }
 }
