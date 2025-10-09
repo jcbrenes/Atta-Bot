@@ -45,6 +45,13 @@
 #define AD0_VAL 1
 #define NUM_LEDS 1  
 
+#define PWM_FREQ 1000
+#define PWM_RESOLUTION 14
+#define LEFT_MOTOR_FWD_CHANNEL 0
+#define LEFT_MOTOR_BWD_CHANNEL 1
+#define RIGHT_MOTOR_FWD_CHANNEL 2
+#define RIGHT_MOTOR_BWD_CHANNEL 3
+
 // Constantes para el WiFi
 const char* ssid = "Atta-Bot";
 const char* password = "attabot1234";
@@ -77,9 +84,9 @@ float currentRightSpeed = 0.0;
 const float distanceOffset = 1 * millimetersPerPulse;
 
 // Constantes para la implementación del control PID
-const int pwmFrequency = 1000;
-const int pwmResolution = 14;  // bits
-const int maxPWMValue = (1 << pwmResolution) - 1;
+//const int pwmFrequency = 1000;
+//const int pwmResolution = 14;  // bits
+const int maxPWMValue = (1 << PWM_RESOLUTION) - 1;
 const int minPWMValue = maxPWMValue * 0.20;
 const float baseSpeed = millimetersPerPulse / samplingTimeS;
 const float maxSpeed = baseSpeed * 5; // Unidades mm/s
@@ -123,6 +130,9 @@ const char* debugMessage = "DEBUG: %d, ID: %s, Direccion: %c, val: Izq|Der, Enco
 String leaderID = "-1";
 bool isLeader = false;
 bool positionReceived = false;
+float globalTargetX = 0;
+float globalTargetY = 0;
+bool hasGlobalTarget = false;
 
 String robotID = "-1";
 std::map<String, IPAddress> robots;
@@ -136,8 +146,8 @@ enum PossibleStates { WAIT = 0,
                       RANDOM_WALK,
                       MESSAGE_BASE,
                       IDENTIFY_OBSTACLE,
-                      ACTIVE_EVASION,
-                      REQUEST_POSITION
+                      ACTIVE_EVASION, 
+                      REQUEST_POSITION                                 
                       };
 
 PossibleStates state = WAIT;
@@ -209,6 +219,53 @@ struct LedController {
 };
 
 LedController ledCtrl;
+
+// ============================================
+// DECLARACIONES FORWARD DE FUNCIONES
+// ============================================
+
+// Funciones de configuración y control
+void SetupFrontSensor();
+void WiFiStatus();
+void setupIMU();
+void updateMillimetersPerPulse();
+
+// Funciones de comunicación
+void ReadUdpPackets();
+void SendMessage(IPAddress host, const char* message);
+void SendPose();
+void MessageDebugf(const char* format, ...);
+void CommunicationTest();
+
+// Funciones de sensores y control
+void ReadSensors();
+void ResetPID();
+void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM);
+
+// Funciones de movimiento
+bool MoveDistanceByWheel(float leftDistance, float rightDistance);
+float DesiredSpeed(float distance, float wheelDistance);
+bool IsStationary(float currentLeftSpeed, float currentRightSpeed, float leftWheelDistance, float rightWheelDistance);
+void SelectMovementRW();
+
+// Funciones auxiliares
+std::array<String, 5> SeparateCommand(const String& command, char delimiter);
+bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id);
+void CalculateAndQueueMovement(float targetX, float targetY);
+void ReadSerialCommands();
+
+// Funciones de LED
+void setLedColor(uint8_t red, uint8_t green, uint8_t blue);
+void setLedBrightness(uint8_t brightness);
+void setLedBlink(uint8_t red, uint8_t green, uint8_t blue, unsigned long intervalMs);
+
+// Funciones IMU
+bool StoreValido(biasStore* store);
+void LeerYaw();
+
+// ============================================
+// FIN DE DECLARACIONES FORWARD
+// ============================================
 
 /*****************************************************************************************
 
@@ -309,51 +366,6 @@ void updateMillimetersPerPulse() {
   millimetersPerPulse = wheelCircumference / pulsesPerRev;
 }
 
-/***************************************************************************************
-
- Función que calcula el vector de movimiento hacia el líder durante la congregación.
- Determina el ángulo y distancia necesarios para llegar a la posición del líder y 
- agrega las instrucciones correspondientes (giro y movimiento) a la cola de instrucciones.
-
- @param targetX Coordenada X del líder (objetivo)
- @param targetY Coordenada Y del líder (objetivo)
-
-***************************************************************************************/
-void CalculateAndQueueMovement(float targetX, float targetY) {
-    // Calcular vector hacia el líder
-    float deltaX = targetX - robotPose.x;
-    float deltaY = targetY - robotPose.y;
-    float distance = sqrt(deltaX * deltaX + deltaY * deltaY);
-    float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
-    
-    // Calcular giro necesario
-    float angleDiff = targetAngle - robotPose.angle;
-    
-    // Normalizar ángulo (-180 a 180)
-    while (angleDiff > 180) angleDiff -= 360;
-    while (angleDiff < -180) angleDiff += 360;
-    
-    MessageDebugf("DEBUG: -1, ID: %s, Vector calculado: dist=%.1fmm, angulo=%.1f°", 
-                  robotID, distance, angleDiff);
-    
-    // Agregar giro si es necesario (umbral de 5 grados)
-    if (abs(angleDiff) > 5) {
-        fsmInstruction[0] = TURN;
-        fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
-        instructionList.push_back(fsmInstruction);
-    }
-    
-    // Agregar movimiento hacia líder (dejar margen de 80mm)
-    if (distance > 80) {
-        fsmInstruction[0] = MOVE;
-        fsmInstruction[1] = distance - 80;
-        instructionList.push_back(fsmInstruction);
-    }
-    
-    MessageDebugf("DEBUG: -1, ID: %s, Instrucciones agregadas para congregación", robotID);
-}
-
-
 
 /***************************************************************************************
 
@@ -367,28 +379,32 @@ void setup() {
   #ifdef DebugSerial
     Serial.begin(115200);
   #endif
-
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  ESP32PWM::allocateTimer(2);
-  ESP32PWM::allocateTimer(3);
   
   frontServo.setPeriodHertz(50);
   frontServo.attach(frontServoPin, 1000, 2000);
   frontServo.write(90);  
   delay(100); 
 
-  analogWriteFrequency(pwmFrequency);
-  analogWriteResolution(pwmResolution);
+  ledcAttach(leftMotorForward, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(leftMotorBackward, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(rightMotorForward, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(rightMotorBackward, PWM_FREQ, PWM_RESOLUTION);
 
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
+
+  String hostname = "AttaBot-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  WiFi.setHostname(hostname.c_str());
+ 
 
   FastLED.addLeds<WS2812, ledPin, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(maxBrightness);
   FastLED.setMaxRefreshRate(120); 
   ledCtrl.setOff(); 
 
+  ArduinoOTA.setHostname(hostname.c_str());
   ArduinoOTA.begin();
+
   udp.begin(localPort);
   DebugSerialPrintf("El servidor UDP se inició en el puerto: %u\n", localPort);
   Wire.begin();
@@ -445,7 +461,7 @@ void loop() {
    if (WiFi.status() != WL_CONNECTED) return;
   ReadUdpPackets();
   ReadSensors();
-  //updateServoSweep();
+  // updateServoSweep();
   // Descomentar solo en caso de prueba rapidas
   // ReadSerialCommands();
 
@@ -595,13 +611,149 @@ void loop() {
     }
 
     case REQUEST_POSITION: {
-      SendMessage(robots["Base"], "REQUEST_POSITION");
-      MessageDebugf("DEBUG: -1, ID: %s, Solicitud de posicion enviada a la base", robotID);
-      state = WAIT;
-      instructionValue = 2000;
+      static unsigned long lastRequestTime = 0;
+      static bool waitingForResponse = false;
+      const unsigned long requestTimeout = 5000;
+
+      // Verificar que Base existe
+      if (robots.find("Base") == robots.end() || robots["Base"] == IPAddress(0,0,0,0)) {
+        MessageDebugf("DEBUG: -1, ID: %s, No hay IP de base", robotID.c_str());
+        waitingForResponse = false;
+        lastRequestTime = 0;
+        state = WAIT;
+        instructionValue = 500;
+        break;
+      }
+
+      // Enviar solicitud solo si no estamos esperando
+      if (!waitingForResponse) {
+        SendMessage(robots["Base"], "REQUEST_POSITION");
+        MessageDebugf("DEBUG: -1, ID: %s, Solicitud enviada", robotID.c_str());
+        lastRequestTime = millis();
+        waitingForResponse = true;
+      }
+
+      // Verificar timeout
+      if (millis() - lastRequestTime > requestTimeout) {
+        MessageDebugf("DEBUG: -1, ID: %s, Timeout", robotID.c_str());
+        waitingForResponse = false;
+        lastRequestTime = 0;
+        state = WAIT;
+        instructionValue = 500;
+        break;
+      }
+
+      // Si recibimos respuesta
+      if (positionReceived) {
+        MessageDebugf("DEBUG: -1, ID: %s, Respuesta recibida", robotID.c_str());
+        waitingForResponse = false;
+        lastRequestTime = 0;
+        positionReceived = false;  // Reset para próxima vez
+        state = WAIT;
+        instructionValue = 100;  // Continuar rápido
+      }
+      
       break;
+    }
+
+  }
+
+}
+
+
+
+/***************************************************************************************
+
+ Función que calcula el vector de movimiento hacia el líder durante la congregación.
+ Determina el ángulo y distancia necesarios para llegar a la posición del líder y 
+ agrega las instrucciones correspondientes (giro y movimiento) a la cola de instrucciones.
+
+ @param targetX Coordenada X del líder (objetivo)
+ @param targetY Coordenada Y del líder (objetivo)
+
+***************************************************************************************/
+void CalculateAndQueueMovement(float targetX, float targetY) {
+    // Calcular vector hacia el líder
+    float deltaX = targetX - robotPose.x;
+    float deltaY = targetY - robotPose.y;
+    float distance = sqrt(deltaX * deltaX + deltaY * deltaY);
+    float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
+    
+    // Calcular giro necesario
+    float angleDiff = targetAngle - robotPose.angle;
+    
+    // Normalizar ángulo (-180 a 180)
+    while (angleDiff > 180) angleDiff -= 360;
+    while (angleDiff < -180) angleDiff += 360;
+    
+    
+    
+    // Agregar giro si es necesario (umbral de 5 grados)
+    if (abs(angleDiff) > 5) {
+        fsmInstruction[0] = TURN;
+        fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
+        instructionList.push_back(fsmInstruction);
+    }
+    
+    // Agregar movimiento hacia líder (dejar margen de 80mm)
+    if (distance > 80) {
+        fsmInstruction[0] = MOVE;
+        fsmInstruction[1] = distance - 80;
+        instructionList.push_back(fsmInstruction);
+    }
+}
+
+
+/***************************************************************************************
+
+ Función que inicializa el sensor frontal APDS-9960 y asegura que esté funcionando 
+ correctamente antes de continuar. Si la inicialización falla, muestra un mensaje de 
+ error en el puerto serial y utiliza un parpadeo en los LEDs del strip para indicar el 
+ estado de fallo hasta que el sensor responda correctamente.
+
+***************************************************************************************/
+void SetupFrontSensor() {
+  static bool sensorInitialized = false;
+  static unsigned long lastAttempt = 0;
+  
+  if (sensorInitialized) return;
+  
+  unsigned long now = millis();
+  if (now - lastAttempt < 100) return;
+  
+  lastAttempt = now;
+  if (frontSensor.begin()) {
+    sensorInitialized = true;
+    ledCtrl.setOff();
+    DebugSerialPrintln("Sensor APDS-9960 inicializado correctamente");
+  } else {
+    DebugSerialPrintln("Fallo la inicialización del sensor APDS-9960.");
+    ledCtrl.setBlink(255, 0, 0, maxBrightness, 250);
   }
 }
+
+/***************************************************************************************
+
+ Función que verifica el estado de la conexión Wi-Fi y espera hasta que el robot esté 
+ conectado a la red. Durante la conexión, se apagan los motores y se indica el estado 
+ de conexión a través de un parpadeo en los LEDs del strip.
+
+***************************************************************************************/
+void WiFiStatus() {
+  if (WiFi.status() != WL_CONNECTED) {
+    static bool wifiConnecting = false;
+    if (!wifiConnecting) {
+      ConfigureHBridge(0, 0);
+      DebugSerialPrintln("Conectando WiFi ...");
+      ledCtrl.setBlink(0, 255, 255, maxBrightness, 250); // Cian parpadeante
+      wifiConnecting = true;
+    }
+    return;
+  } else {
+    ledCtrl.setOff();
+  }
+}
+
 
 /***************************************************************************************
 
@@ -671,57 +823,6 @@ void ReadSerialCommands() {
   }
 }
 
-
-/***************************************************************************************
-
- Función que verifica el estado de la conexión Wi-Fi y espera hasta que el robot esté 
- conectado a la red. Durante la conexión, se apagan los motores y se indica el estado 
- de conexión a través de un parpadeo en los LEDs del strip.
-
-***************************************************************************************/
-void WiFiStatus() {
-  if (WiFi.status() != WL_CONNECTED) {
-    static bool wifiConnecting = false;
-    if (!wifiConnecting) {
-      ConfigureHBridge(0, 0);
-      DebugSerialPrintln("Conectando WiFi ...");
-      ledCtrl.setBlink(0, 255, 255, maxBrightness, 250); // Cian parpadeante
-      wifiConnecting = true;
-    }
-    return;
-  } else {
-    ledCtrl.setOff();
-  }
-}
-
-
-/***************************************************************************************
-
- Función que inicializa el sensor frontal APDS-9960 y asegura que esté funcionando 
- correctamente antes de continuar. Si la inicialización falla, muestra un mensaje de 
- error en el puerto serial y utiliza un parpadeo en los LEDs del strip para indicar el 
- estado de fallo hasta que el sensor responda correctamente.
-
-***************************************************************************************/
-void SetupFrontSensor() {
-  static bool sensorInitialized = false;
-  static unsigned long lastAttempt = 0;
-  
-  if (sensorInitialized) return;
-  
-  unsigned long now = millis();
-  if (now - lastAttempt < 100) return;
-  
-  lastAttempt = now;
-  if (frontSensor.begin()) {
-    sensorInitialized = true;
-    ledCtrl.setOff();
-    DebugSerialPrintln("Sensor APDS-9960 inicializado correctamente");
-  } else {
-    DebugSerialPrintln("Fallo la inicialización del sensor APDS-9960.");
-    ledCtrl.setBlink(255, 0, 0, maxBrightness, 250);
-  }
-}
 
 
 /*******************************************************************************************
@@ -929,9 +1030,9 @@ void ReadUdpPackets() {
     ESP.restart();
 
   } else if (command == "SERVO") {
-    int servoAngle = constrain(arguments[1].toInt(), 5, 175);
-    DebugSerialPrintf("Servo: %d°\n", servoAngle);
-    frontServo.write(servoAngle);
+    //int servoAngle = constrain(arguments[1].toInt(), 5, 175);
+    //DebugSerialPrintf("Servo: %d°\n", servoAngle);
+    //frontServo.write(servoAngle);
     
   } else if (command == "PID") {
     float kp = arguments[1].toFloat();
@@ -1010,55 +1111,112 @@ void ReadUdpPackets() {
 
   } else if (command == "CONGREGATION") {
     leaderID = arguments[1];
-    isLeader = (robotID == leaderID);
+    isLeader = (leaderID == robotID);
     positionReceived = false;
-    
-    MessageDebugf("DEBUG: -1, ID: %s, Congregación iniciada. Líder: %s", robotID, leaderID);
-    
-    // Solicitud escalonada basada en ID (200ms por robot)
-    int delay = robotID.toInt() * 200;
+    hasGlobalTarget = false;
+
+    MessageDebugf("DEBUG: -1, ID: %s, Congregacion iniciada. Lider: %s", robotID, leaderID.c_str());
+
+    int delay = robotID.toInt() * 200; // Retraso basado en ID para evitar colisiones
     fsmInstruction[0] = WAIT;
     fsmInstruction[1] = delay;
     instructionList.push_back(fsmInstruction);
+
+    fsmInstruction[0] = REQUEST_POSITION;
+    fsmInstruction[1] = 0;
+    instructionList.push_back(fsmInstruction);
+
+  } else if (command == "POSITIONGT") {
+    // Nueva función para ir a una posición global
+    float targetX = arguments[1].toFloat();
+    float targetY = arguments[2].toFloat();
     
-    // Después del delay, cambiar a estado de solicitud
+    // Guardar posición objetivo
+    globalTargetX = targetX;
+    globalTargetY = targetY;
+    hasGlobalTarget = true;  // NUEVO
+    positionReceived = false;
+
+    MessageDebugf("DEBUG: -1, ID: %s, Objetivo global establecido: x=%.1f, y=%.1f", 
+                  robotID.c_str(), globalTargetX, globalTargetY);
+
+    // Solicitar posición actual
     fsmInstruction[0] = REQUEST_POSITION;
     fsmInstruction[1] = 0;
     instructionList.push_back(fsmInstruction);
 
   } else if (command == "POSITION_RESPONSE") {
+    // 1. Actualizar pose
+    robotPose.x = arguments[1].toFloat();
+    robotPose.y = arguments[2].toFloat();
+    robotPose.angle = arguments[3].toFloat();
+    positionReceived = true;  // ✅ Setear PRIMERO
+
+    MessageDebugf("DEBUG: -1, ID: %s, Posicion recibida: x=%.1f, y=%.1f, angulo=%.1f", 
+                  robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
+
+    // 1. Actualizar pose (TODOS los robots)
     robotPose.x = arguments[1].toFloat();
     robotPose.y = arguments[2].toFloat();
     robotPose.angle = arguments[3].toFloat();
     positionReceived = true;
     
-    MessageDebugf("DEBUG: -1, ID: %s, Posición recibida: %.1f,%.1f,%.1f", 
-                  robotID, robotPose.x, robotPose.y, robotPose.angle);
-    
-    if (isLeader) {
-        // El líder broadcastea su posición
-        char buffer[60];
-        snprintf(buffer, sizeof(buffer), "LEADER_POSITION|%s|%.1f|%.1f|%.1f", 
-                robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
-        SendMessage(robots["Broadcast"], buffer);
-        MessageDebugf("DEBUG: -1, ID: %s, Enviando posición como líder", robotID);
-    }
+    MessageDebugf("DEBUG: -1, ID: %s, Posicion recibida: x=%.1f, y=%.1f, angulo=%.1f", 
+                  robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
 
+    // 2. SOLO si estoy en modo CONGREGATION y soy el líder, broadcast mi posición
+    if (isLeader && leaderID != "-1") {
+      char buffer[64];
+      snprintf(buffer, sizeof(buffer), "LEADER_POSITION|%s|%.1f|%.1f", 
+                robotID.c_str(), robotPose.x, robotPose.y);
+      
+      if (robots.find("Broadcast") != robots.end()) {
+          SendMessage(robots["Broadcast"], buffer);
+          delayMicroseconds(500);
+          SendMessage(robots["Broadcast"], buffer);  // Enviar 2 veces por UDP
+          MessageDebugf("DEBUG: -1, ID: %s, Broadcasting posicion de lider", 
+                        robotID.c_str());
+      }
+    }
+    
+    // 3. Si tengo un objetivo global guardado (POSITIONGT o seguidor esperando líder)
+    if (hasGlobalTarget) {
+        CalculateAndQueueMovement(globalTargetX, globalTargetY);
+        hasGlobalTarget = false;
+        globalTargetX = 0;
+        globalTargetY = 0;
+    }
   } else if (command == "LEADER_POSITION") {
     String receivedLeaderID = arguments[1];
-    
-    if (!isLeader && receivedLeaderID == leaderID && positionReceived) {
+
+    // ✅ Permitir que seguidores guarden la posición del líder aunque no tengan la suya
+    if (!isLeader && receivedLeaderID == leaderID) {
         float leaderX = arguments[2].toFloat();
         float leaderY = arguments[3].toFloat();
         
-        MessageDebugf("DEBUG: -1, ID: %s, Recibida posición del líder %s: %.1f,%.1f", 
-                      robotID, receivedLeaderID, leaderX, leaderY);
-        
-        CalculateAndQueueMovement(leaderX, leaderY);
+        if (positionReceived) {
+            // Tengo mi posición, puedo moverme ahora
+            MessageDebugf("DEBUG: -1, ID: %s, Procesando posicion del lider", robotID.c_str());
+            CalculateAndQueueMovement(leaderX, leaderY);
+        } else {
+            // No tengo mi posición, guardar objetivo para más tarde
+            globalTargetX = leaderX;
+            globalTargetY = leaderY;
+            hasGlobalTarget = true;
+            MessageDebugf("DEBUG: -1, ID: %s, Guardando posicion del lider para despues", robotID.c_str());
+        }
     }
+  } else if (command == "CANCEL_CONGREGATION") {
+    leaderID = "-1";
+    isLeader = false;
+    positionReceived = false;
+    hasGlobalTarget = false;
+    instructionList.clear();
+    state = STOP;
+    MessageDebugf("DEBUG: -1, ID: %s, Congregacion cancelada", robotID.c_str());
   }
+} 
 
-}
 /***************************************************************************************
 
  Función que lee el estado de los sensores de proximidad y la batería. En cada ciclo, 
@@ -1144,19 +1302,19 @@ void ResetPID() {
 ***************************************************************************************/
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
   if (leftWheelPWM >= 0) {
-    analogWrite(leftMotorBackward, 0);
-    analogWrite(leftMotorForward, leftWheelPWM);
-  } else if (leftWheelPWM < 0) {
-    analogWrite(leftMotorForward, 0);
-    analogWrite(leftMotorBackward, _abs(leftWheelPWM));
+    ledcWrite(leftMotorBackward, 0);
+    ledcWrite(leftMotorForward, leftWheelPWM);
+  } else {
+    ledcWrite(leftMotorForward, 0);
+    ledcWrite(leftMotorBackward, _abs(leftWheelPWM));
   }
 
   if (rightWheelPWM >= 0) {
-    analogWrite(rightMotorBackward, 0);
-    analogWrite(rightMotorForward, rightWheelPWM);
-  } else if (rightWheelPWM < 0) {
-    analogWrite(rightMotorForward, 0);
-    analogWrite(rightMotorBackward, _abs(rightWheelPWM));
+    ledcWrite(rightMotorBackward, 0);
+    ledcWrite(rightMotorForward, rightWheelPWM);
+  } else {
+    ledcWrite(rightMotorForward, 0);
+    ledcWrite(rightMotorBackward, _abs(rightWheelPWM));
   }
 }
 
@@ -1300,7 +1458,7 @@ void SendPose() {
   char buffer[40];
   snprintf(buffer, sizeof(buffer), message, obstacleSensors, robotPose.x, robotPose.y, robotPose.angle);
   SendMessage(robots["Broadcast"], buffer);
-  previousMillis - millis();
+  previousMillis = millis();
 }
 
 
@@ -1630,7 +1788,7 @@ ICM_20948_Status_e ICM_20948::initializeDMP(void) {
   //  250dps : 2^25
   const unsigned char gyroFullScale[4] = { 0x10, 0x00, 0x00, 0x00 };
   result = writeDMPmems(GYRO_FULLSCALE, 4, &gyroFullScale[0]);
-  if (result > worstResult) worstResult = result;
+   if (result > worstResult) worstResult = result;
 
   // Configure the Accel Only Gain: 15252014 (225Hz) 30504029 (112Hz) 61117001 (56Hz)
   //const unsigned char accelOnlyGain[4] = {0x03, 0xA4, 0x92, 0x49}; // 56Hz
