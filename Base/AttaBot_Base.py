@@ -685,39 +685,10 @@ class Base(object):
         # Crear socket UDP
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.bind(('', self.port))
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**20)
+        self.sock.bind((self.baseIP, self.port))
 
-    """
-    def configUdp(self, configuration):
-    
-    Configura la comunicación UDP para el sistema.
-    
-
-    import socket
-
-    self.baseIP = configuration['base_ip']          # ej. 192.168.1.1 (Ethernet de tu PC)
-    self.broadcastIP = configuration['broadcast_ip'] # ej. 192.168.1.255
-    self.port = configuration['port']
-
-    # Crear socket UDP
-    self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-    # Permitir broadcast
-    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-
-    # Reusar puerto/dirección (necesario en Linux, seguro en Windows)
-    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    except AttributeError:
-        pass  # Windows no soporta SO_REUSEPORT
-
-    # Aumentar buffer de recepción (útil si responden muchos robots a la vez)
-    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**20)
-
-    # Bind explícito a la interfaz Ethernet (no usar '' en Linux)
-    self.sock.bind((self.baseIP, self.port))
-"""
 
 
     def configVisionSystem(self, configuration):
