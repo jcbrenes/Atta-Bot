@@ -202,13 +202,30 @@ struct LedController {
     unsigned long now = millis();
     switch (currentState) {
       case OFF:
-        if (brightness != 0) { brightness = 0; FastLED.setBrightness(0); FastLED.show(); }
+        if (brightness != 0) { 
+          brightness = 0;
+          FastLED.setBrightness(0); 
+          FastLED.show(); 
+        }
       break;
       case SOLID:
-        if (now - lastUpdate > 50) { leds[0] = CRGB(red, green, blue); FastLED.setBrightness(brightness); FastLED.show(); lastUpdate = now; }
+        if (now - lastUpdate > 50) { 
+          leds[0] = CRGB(red, green, blue); 
+          FastLED.setBrightness(brightness); 
+          FastLED.show(); lastUpdate = now; 
+        }
         break;
       case BLINKING:
-        if (now - lastUpdate >= interval) { blinkState = !blinkState; if (blinkState) { leds[0] = CRGB(red, green, blue); FastLED.setBrightness(brightness); } else { FastLED.setBrightness(0); } FastLED.show(); lastUpdate = now; }
+        if (now - lastUpdate >= interval) { 
+          blinkState = !blinkState;
+          if (blinkState) { 
+            leds[0] = CRGB(red, green, blue); 
+            FastLED.setBrightness(brightness); 
+
+          } else { FastLED.setBrightness(0); } 
+            
+          FastLED.show(); lastUpdate = now; 
+        }
         break;
     }
   }
@@ -360,6 +377,8 @@ void LowBattery() {
 
 /***************************************************************************************
 
+Funcion que actualiza el valor de millimetersPerPulse en caso de que se modifique el valor
+mediante paquetes UDP.
 
 **************************************************************************************/
 void updateMillimetersPerPulse() {
@@ -415,6 +434,7 @@ void setup() {
   pinMode(leftEncoderC2, INPUT_PULLUP);
   pinMode(rightEncoderC1, INPUT_PULLUP);
   pinMode(rightEncoderC2, INPUT_PULLUP);
+
   attachInterrupt(digitalPinToInterrupt(leftEncoderC1), LeftWheelPulses, CHANGE);
   attachInterrupt(digitalPinToInterrupt(leftEncoderC2), LeftWheelPulses, CHANGE);
   attachInterrupt(digitalPinToInterrupt(rightEncoderC1), RightWheelPulses, CHANGE);
@@ -422,8 +442,10 @@ void setup() {
 
   pinMode(enableLeftInfraredSensor, OUTPUT);
   pinMode(enableRightInfraredSensor, OUTPUT);
+
   digitalWrite(enableLeftInfraredSensor, LOW);
   digitalWrite(enableRightInfraredSensor, LOW);
+
   pinMode(batteryStatus, INPUT);
   attachInterrupt(digitalPinToInterrupt(batteryStatus), LowBattery, FALLING);
   pinMode(leftInfraredSensor, INPUT);
@@ -453,6 +475,8 @@ void setup() {
  - READ_INSTRUCTION: Lee la siguiente instrucción de la lista de instrucciones.
  - MESSAGE_BASE: Envía un mensaje a la base con el estado del robot.
  - IDENTIFY_OBSTACLE: Identifica si el obstáculo detectado es otro robot o no.
+ - ACTIVE_EVASION: (No implementado en este fragmento)
+  - REQUEST_POSITION: Solicita la posición al robot base y maneja la respuesta.
 
 ***************************************************************************************/
 void loop() {
@@ -461,9 +485,11 @@ void loop() {
    if (WiFi.status() != WL_CONNECTED) return;
   ReadUdpPackets();
   ReadSensors();
-  // updateServoSweep();
-  // Descomentar solo en caso de prueba rapidas
-  // ReadSerialCommands();
+  
+  #ifdef DebugSerial
+    ReadSerialCommands();
+  #endif
+
 
   switch (state) {
     case WAIT: {
@@ -615,7 +641,6 @@ void loop() {
       static bool waitingForResponse = false;
       const unsigned long requestTimeout = 5000;
 
-      // Verificar que Base existe
       if (robots.find("Base") == robots.end() || robots["Base"] == IPAddress(0,0,0,0)) {
         MessageDebugf("DEBUG: -1, ID: %s, No hay IP de base", robotID.c_str());
         waitingForResponse = false;
@@ -625,7 +650,6 @@ void loop() {
         break;
       }
 
-      // Enviar solicitud solo si no estamos esperando
       if (!waitingForResponse) {
         SendMessage(robots["Base"], "REQUEST_POSITION");
         MessageDebugf("DEBUG: -1, ID: %s, Solicitud enviada", robotID.c_str());
@@ -643,14 +667,14 @@ void loop() {
         break;
       }
 
-      // Si recibimos respuesta
+    
       if (positionReceived) {
         MessageDebugf("DEBUG: -1, ID: %s, Respuesta recibida", robotID.c_str());
         waitingForResponse = false;
         lastRequestTime = 0;
-        positionReceived = false;  // Reset para próxima vez
+        positionReceived = false;  
         state = WAIT;
-        instructionValue = 100;  // Continuar rápido
+        instructionValue = 100;  
       }
       
       break;
@@ -659,8 +683,6 @@ void loop() {
   }
 
 }
-
-
 
 /***************************************************************************************
 
@@ -673,36 +695,28 @@ void loop() {
 
 ***************************************************************************************/
 void CalculateAndQueueMovement(float targetX, float targetY) {
-    // Calcular vector hacia el líder
+    
     float deltaX = targetX - robotPose.x;
     float deltaY = targetY - robotPose.y;
     float distance = sqrt(deltaX * deltaX + deltaY * deltaY);
     float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
-    
-    // Calcular giro necesario
     float angleDiff = targetAngle - robotPose.angle;
     
-    // Normalizar ángulo (-180 a 180)
     while (angleDiff > 180) angleDiff -= 360;
     while (angleDiff < -180) angleDiff += 360;
     
-    
-    
-    // Agregar giro si es necesario (umbral de 5 grados)
     if (abs(angleDiff) > 5) {
         fsmInstruction[0] = TURN;
         fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
         instructionList.push_back(fsmInstruction);
     }
     
-    // Agregar movimiento hacia líder (dejar margen de 80mm)
     if (distance > 80) {
         fsmInstruction[0] = MOVE;
         fsmInstruction[1] = distance - 80;
         instructionList.push_back(fsmInstruction);
     }
 }
-
 
 /***************************************************************************************
 
@@ -754,7 +768,6 @@ void WiFiStatus() {
   }
 }
 
-
 /***************************************************************************************
 
 Funcion selector del color del strip LED. 
@@ -763,6 +776,7 @@ Funcion selector del color del strip LED.
 void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
   ledCtrl.setSolid(red, green, blue, maxBrightness);
 }
+
 /***************************************************************************************
 
   Función para establecer el brillo del strip LED. 
@@ -843,7 +857,7 @@ void CommunicationTest(){
       }
     }
   } else {
-    ledCtrl.setSolid(255, 0, 0, 255); // Rojo sólido
+    ledCtrl.setSolid(255, 0, 0, 255); 
   }
 }
 
@@ -881,7 +895,6 @@ std::array<String, 5> SeparateCommand(const String& command, char delimiter) {
 
   return results;
 }
-
 
 /***************************************************************************************
 
@@ -1030,9 +1043,9 @@ void ReadUdpPackets() {
     ESP.restart();
 
   } else if (command == "SERVO") {
-    //int servoAngle = constrain(arguments[1].toInt(), 5, 175);
-    //DebugSerialPrintf("Servo: %d°\n", servoAngle);
-    //frontServo.write(servoAngle);
+    int servoAngle = constrain(arguments[1].toInt(), 5, 175);
+    DebugSerialPrintf("Servo: %d°\n", servoAngle);
+    frontServo.write(servoAngle);
     
   } else if (command == "PID") {
     float kp = arguments[1].toFloat();
@@ -1127,44 +1140,32 @@ void ReadUdpPackets() {
     instructionList.push_back(fsmInstruction);
 
   } else if (command == "POSITIONGT") {
-    // Nueva función para ir a una posición global
+    
     float targetX = arguments[1].toFloat();
     float targetY = arguments[2].toFloat();
     
-    // Guardar posición objetivo
     globalTargetX = targetX;
     globalTargetY = targetY;
-    hasGlobalTarget = true;  // NUEVO
+    hasGlobalTarget = true;  
     positionReceived = false;
 
     MessageDebugf("DEBUG: -1, ID: %s, Objetivo global establecido: x=%.1f, y=%.1f", 
                   robotID.c_str(), globalTargetX, globalTargetY);
 
-    // Solicitar posición actual
     fsmInstruction[0] = REQUEST_POSITION;
     fsmInstruction[1] = 0;
     instructionList.push_back(fsmInstruction);
 
   } else if (command == "POSITION_RESPONSE") {
-    // 1. Actualizar pose
-    robotPose.x = arguments[1].toFloat();
-    robotPose.y = arguments[2].toFloat();
-    robotPose.angle = arguments[3].toFloat();
-    positionReceived = true;  // ✅ Setear PRIMERO
-
-    MessageDebugf("DEBUG: -1, ID: %s, Posicion recibida: x=%.1f, y=%.1f, angulo=%.1f", 
-                  robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
-
-    // 1. Actualizar pose (TODOS los robots)
+    
     robotPose.x = arguments[1].toFloat();
     robotPose.y = arguments[2].toFloat();
     robotPose.angle = arguments[3].toFloat();
     positionReceived = true;
-    
+
     MessageDebugf("DEBUG: -1, ID: %s, Posicion recibida: x=%.1f, y=%.1f, angulo=%.1f", 
                   robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
 
-    // 2. SOLO si estoy en modo CONGREGATION y soy el líder, broadcast mi posición
     if (isLeader && leaderID != "-1") {
       char buffer[64];
       snprintf(buffer, sizeof(buffer), "LEADER_POSITION|%s|%.1f|%.1f", 
@@ -1173,13 +1174,12 @@ void ReadUdpPackets() {
       if (robots.find("Broadcast") != robots.end()) {
           SendMessage(robots["Broadcast"], buffer);
           delayMicroseconds(500);
-          SendMessage(robots["Broadcast"], buffer);  // Enviar 2 veces por UDP
+          SendMessage(robots["Broadcast"], buffer);  
           MessageDebugf("DEBUG: -1, ID: %s, Broadcasting posicion de lider", 
                         robotID.c_str());
       }
     }
     
-    // 3. Si tengo un objetivo global guardado (POSITIONGT o seguidor esperando líder)
     if (hasGlobalTarget) {
         CalculateAndQueueMovement(globalTargetX, globalTargetY);
         hasGlobalTarget = false;
@@ -1189,17 +1189,14 @@ void ReadUdpPackets() {
   } else if (command == "LEADER_POSITION") {
     String receivedLeaderID = arguments[1];
 
-    // ✅ Permitir que seguidores guarden la posición del líder aunque no tengan la suya
     if (!isLeader && receivedLeaderID == leaderID) {
         float leaderX = arguments[2].toFloat();
         float leaderY = arguments[3].toFloat();
         
         if (positionReceived) {
-            // Tengo mi posición, puedo moverme ahora
             MessageDebugf("DEBUG: -1, ID: %s, Procesando posicion del lider", robotID.c_str());
             CalculateAndQueueMovement(leaderX, leaderY);
         } else {
-            // No tengo mi posición, guardar objetivo para más tarde
             globalTargetX = leaderX;
             globalTargetY = leaderY;
             hasGlobalTarget = true;
