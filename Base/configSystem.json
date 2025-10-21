@@ -50,48 +50,49 @@
             "colors": ["verde_claro", "magenta"]
         },
         "2": {
-            "name": "Robot_Magenta-Verde_claro",
-            "colors": ["magenta", "verde_claro"]
-        },
-        "3": {
-            "name": "Robot_Verde_claro-Azul",
-            "colors": ["verde_claro", "azul"]
-        },
-        "4": {
             "name": "Robot_Azul-Verde_claro",
             "colors": ["azul", "verde_claro"]
         },
-        "5": {
-            "name": "Robot_Magenta-Azul",
-            "colors": ["magenta", "azul"]
-        },
-        "6": {
-            "name": "Robot_Azul-Magenta",
-            "colors": ["azul", "magenta"]
-        },   
-        "7": {
+        "3": {
             "name": "Robot_Cyan-Verde_claro",
             "colors": ["cyan", "verde_claro"]
+        },
+        "4": {
+            "name": "Robot_Magenta-Verde_claro",
+            "colors": ["magenta", "verde_claro"]
+        },
+        "5": {
+            "name": "Robot_Cyan-Azul",
+            "colors": ["cyan", "azul"]
+        },
+        "6": {
+            "name": "Robot_Azul-Cyan",
+            "colors": ["azul", "cyan"]
+        },
+        "7": {
+            "name": "Robot_Magenta-Cyan",
+            "colors": ["magenta", "cyan"]
         },
         "8": {
             "name": "Robot_Verde_claro-Cyan",
             "colors": ["verde_claro", "cyan"]
         },
         "9": {
-            "name": "Robot_Cyan-Azul",
-            "colors": ["cyan", "azul"]
-        },
+            "name": "Robot_Verde_claro-Azul",
+            "colors": ["verde_claro", "azul"]
+        },        
         "10": {
-            "name": "Robot_Azul-Cyan",
-            "colors": ["azul", "cyan"]
+            "name": "Robot_Magenta-Azul",
+            "colors": ["magenta", "azul"]
         },
         "11": {
+            "name": "Robot_Azul-Magenta",
+            "colors": ["azul", "magenta"]
+        },               
+        "12": {
             "name": "Robot_Cyan-Magenta",
             "colors": ["cyan", "magenta"]
-        },
-        "12": {
-            "name": "Robot_Magenta-Cyan",
-            "colors": ["magenta", "cyan"]
         }
+        
     }
 }

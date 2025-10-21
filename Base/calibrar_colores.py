@@ -2,7 +2,10 @@ import cv2
 import numpy as np
 import json
 from pathlib import Path
-
+'''
+Herramienta para calibrar colores usando OpenCV y trackbars. Permite ajustar los valores HSV para diferentes colores,
+visualizar el resultado en tiempo real y guardar la configuración en un archivo JSON.
+'''
 class ColorCalibrator:
     def __init__(self, config_path='config.json'):
         self.config_path = config_path
