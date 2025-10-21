@@ -4,6 +4,9 @@ import json
 import time
 import math
 
+'''
+Herramienta para calibrar la cámara y calcular el factor mm/píxel usando OpenCV. Permite calibrar los parámetros intrínsecos de la cámara, 
+'''
 class CameraCalibrator:
     def __init__(self):
         self.camera = None
@@ -18,7 +21,7 @@ class CameraCalibrator:
         self.camera = cv2.VideoCapture(camera_id, cv2.CAP_V4L2)
         
         # Usar la misma resolución que el sistema original
-        width, height = 1920, 1080  # Ajusta según tu configuración
+        width, height = 1920, 1080  # Ajusta según configuración
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         
@@ -33,7 +36,7 @@ class CameraCalibrator:
         print("Necesitas un tablero de ajedrez para la calibración")
         print("Tu tablero: 9x6 esquinas internas, cuadrados de 39mm")
         
-        # Configuración del patrón - ajustado para tu tablero específico
+        # Configuración del patrón - ajustado para tablero específico
         pattern_size = (9, 6)  # Esquinas internas detectables en tu tablero (largo x ancho)
         square_size = 39.0  # mm - tamaño real de tus cuadrados
         
@@ -93,7 +96,7 @@ class CameraCalibrator:
                 time.sleep(0.5)  # Evitar capturas duplicadas
             elif key == 27:  # ESC
                 if len(image_points) < 10:
-                    print("⚠️  Necesitas al menos 10 imágenes para una calibración mínima")
+                    print("Necesitas al menos 10 imágenes para una calibración mínima")
                     continue
                 else:
                     break
