@@ -1,9 +1,10 @@
 #include "utils.h"
 #include <Adafruit_APDS9960.h> // Adafruit_APDS9960. v1.3.0
 #include <EEPROM.h>
-#include <Freenove_WS2812_Lib_for_ESP32.h> // Freenove WS2812 Lib for ESP32. v1.0.5
+#include <FastLED.h> // FastLED by Daniel Garcia. v 3.10.2
 #include <ICM_20948.h> // SparkFun ICM-20948 Arduino Library. v1.2.12
-#include <Servo.h> // ServoESP32. v1.03
+#include <ESP32Servo.h> // ESP32Servo Kevin Harrington v3.0.9
+//#include <ESPmDNS.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
@@ -42,6 +43,14 @@
 #define batteryStatus 19
 #define ledPin 2
 #define AD0_VAL 1
+#define NUM_LEDS 1  
+
+#define PWM_FREQ 1000
+#define PWM_RESOLUTION 14
+#define LEFT_MOTOR_FWD_CHANNEL 0
+#define LEFT_MOTOR_BWD_CHANNEL 1
+#define RIGHT_MOTOR_FWD_CHANNEL 2
+#define RIGHT_MOTOR_BWD_CHANNEL 3
 
 // Constantes para el WiFi
 const char* ssid = "Atta-Bot";
@@ -50,15 +59,15 @@ const unsigned int localPort = 6060;
 char receivedPacket[255];
 
 // Constantes del robot empleado
-const float pulsesPerRev = 574;             // Cantidad de pulsos por revolucion
+float pulsesPerRev = 820;             // Cantidad de pulsos por revolucion
 const float wheelCircumference = PI * 44.5;  // Diametro de la rueda = 44.5mm
-const float millimetersPerPulse = wheelCircumference / (float)pulsesPerRev;
+float millimetersPerPulse = wheelCircumference / (float)pulsesPerRev;
 const float centerToWheelDistance = 41.5;  // Radio de giro del carro, es la distancia en mm entre el centro y una rueda.
 
 // Muestreo velocidad
 const unsigned int samplingTime = 10;  // en ms
 const float samplingTimeS = (float)samplingTime * 0.001;
-unsigned long currentMillis = millis();
+unsigned long currentMillis = millis( );
 unsigned long previousMillis = millis();
 unsigned long previousMillisRW = 0;
 const unsigned int SteadyStateTime = 800;
@@ -75,9 +84,9 @@ float currentRightSpeed = 0.0;
 const float distanceOffset = 1 * millimetersPerPulse;
 
 // Constantes para la implementación del control PID
-const int pwmFrequency = 1000;
-const int pwmResolution = 14;  // bits
-const int maxPWMValue = (1 << pwmResolution) - 1;
+//const int pwmFrequency = 1000;
+//const int pwmResolution = 14;  // bits
+const int maxPWMValue = (1 << PWM_RESOLUTION) - 1;
 const int minPWMValue = maxPWMValue * 0.20;
 const float baseSpeed = millimetersPerPulse / samplingTimeS;
 const float maxSpeed = baseSpeed * 5; // Unidades mm/s
@@ -111,10 +120,19 @@ int obstacleSensors;
 int centralDistance;
 const int reverseDistance = -40;  // mm
 
+
 int debugUdp = 0;
 int debugCounter = 0;
 char direction = '+';
 const char* debugMessage = "DEBUG: %d, ID: %s, Direccion: %c, val: Izq|Der, Encoder: %d|%d, Vel: %.2f|%.2f, Pwm: %d|%d, ErrorP: %.2f|%.2f, ErrorI: %.2f|%.2f, Dis: %.2f|%.2f, Tiempo: %d";
+
+// Variables para Congregacion
+String leaderID = "-1";
+bool isLeader = false;
+bool positionReceived = false;
+float globalTargetX = 0;
+float globalTargetY = 0;
+bool hasGlobalTarget = false;
 
 String robotID = "-1";
 std::map<String, IPAddress> robots;
@@ -127,7 +145,10 @@ enum PossibleStates { WAIT = 0,
                       REVERSE,
                       RANDOM_WALK,
                       MESSAGE_BASE,
-                      IDENTIFY_OBSTACLE };
+                      IDENTIFY_OBSTACLE,
+                      ACTIVE_EVASION, 
+                      REQUEST_POSITION                                 
+                      };
 
 PossibleStates state = WAIT;
 float instructionValue = 100;
@@ -165,10 +186,103 @@ int sendMessages = 0;
 
 Servo frontServo;
 Adafruit_APDS9960 frontSensor;
-Freenove_ESP32_WS2812 strip = Freenove_ESP32_WS2812(1, ledPin);
+CRGB leds[NUM_LEDS];
 WiFiUDP udp;
 ICM_20948_I2C imu;
 
+// Estructura para control no bloqueante de LEDs
+struct LedController {
+  enum State { OFF, SOLID, BLINKING };
+  State currentState = OFF;
+  uint8_t red = 0, green = 0, blue = 0, brightness = 0;
+  unsigned long lastUpdate = 0, interval = 500;
+  bool blinkState = false;
+  
+  void update() {
+    unsigned long now = millis();
+    switch (currentState) {
+      case OFF:
+        if (brightness != 0) { 
+          brightness = 0;
+          FastLED.setBrightness(0); 
+          FastLED.show(); 
+        }
+      break;
+      case SOLID:
+        if (now - lastUpdate > 50) { 
+          leds[0] = CRGB(red, green, blue); 
+          FastLED.setBrightness(brightness); 
+          FastLED.show(); lastUpdate = now; 
+        }
+        break;
+      case BLINKING:
+        if (now - lastUpdate >= interval) { 
+          blinkState = !blinkState;
+          if (blinkState) { 
+            leds[0] = CRGB(red, green, blue); 
+            FastLED.setBrightness(brightness); 
+
+          } else { FastLED.setBrightness(0); } 
+            
+          FastLED.show(); lastUpdate = now; 
+        }
+        break;
+    }
+  }
+  
+  void setSolid(uint8_t r, uint8_t g, uint8_t b, uint8_t bright = 255) { red = r; green = g; blue = b; brightness = bright; currentState = SOLID; }
+  void setBlink(uint8_t r, uint8_t g, uint8_t b, uint8_t bright = 255, unsigned long intervalMs = 250) { red = r; green = g; blue = b; brightness = bright; interval = intervalMs; currentState = BLINKING; lastUpdate = 0; }
+  void setOff() { currentState = OFF; }
+};
+
+LedController ledCtrl;
+
+// ============================================
+// DECLARACIONES FORWARD DE FUNCIONES
+// ============================================
+
+// Funciones de configuración y control
+void SetupFrontSensor();
+void WiFiStatus();
+void setupIMU();
+void updateMillimetersPerPulse();
+
+// Funciones de comunicación
+void ReadUdpPackets();
+void SendMessage(IPAddress host, const char* message);
+void SendPose();
+void MessageDebugf(const char* format, ...);
+void CommunicationTest();
+
+// Funciones de sensores y control
+void ReadSensors();
+void ResetPID();
+void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM);
+
+// Funciones de movimiento
+bool MoveDistanceByWheel(float leftDistance, float rightDistance);
+float DesiredSpeed(float distance, float wheelDistance);
+bool IsStationary(float currentLeftSpeed, float currentRightSpeed, float leftWheelDistance, float rightWheelDistance);
+void SelectMovementRW();
+
+// Funciones auxiliares
+std::array<String, 5> SeparateCommand(const String& command, char delimiter);
+bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id);
+void CalculateAndQueueMovement(float targetX, float targetY);
+void ReadSerialCommands();
+
+// Funciones de LED
+void setLedColor(uint8_t red, uint8_t green, uint8_t blue);
+void setLedBrightness(uint8_t brightness);
+void setLedBlink(uint8_t red, uint8_t green, uint8_t blue, unsigned long intervalMs);
+
+// Funciones IMU
+bool StoreValido(biasStore* store);
+void LeerYaw();
+
+// ============================================
+// FIN DE DECLARACIONES FORWARD
+// ============================================
 
 /*****************************************************************************************
 
@@ -263,6 +377,17 @@ void LowBattery() {
 
 /***************************************************************************************
 
+Funcion que actualiza el valor de millimetersPerPulse en caso de que se modifique el valor
+mediante paquetes UDP.
+
+**************************************************************************************/
+void updateMillimetersPerPulse() {
+  millimetersPerPulse = wheelCircumference / pulsesPerRev;
+}
+
+
+/***************************************************************************************
+
  Función de configuración del robot que se ejecuta una vez al inicio del programa.
  Esta función inicializa los componentes del robot, configura las interrupciones, 
  establece la comunicación Wi-Fi y el servidor UDP, y ajusta la configuración de 
@@ -273,28 +398,43 @@ void setup() {
   #ifdef DebugSerial
     Serial.begin(115200);
   #endif
+  
+  frontServo.setPeriodHertz(50);
+  frontServo.attach(frontServoPin, 1000, 2000);
+  frontServo.write(90);  
+  delay(100); 
 
-  analogWriteFrequency(pwmFrequency);
-  analogWriteResolution(pwmResolution);
+  ledcAttach(leftMotorForward, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(leftMotorBackward, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(rightMotorForward, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(rightMotorBackward, PWM_FREQ, PWM_RESOLUTION);
 
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-  strip.begin();
-  WiFiStatus();
+
+  String hostname = "AttaBot-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  WiFi.setHostname(hostname.c_str());
+ 
+
+  FastLED.addLeds<WS2812, ledPin, GRB>(leds, NUM_LEDS);
+  FastLED.setBrightness(maxBrightness);
+  FastLED.setMaxRefreshRate(120); 
+  ledCtrl.setOff(); 
+
+  ArduinoOTA.setHostname(hostname.c_str());
   ArduinoOTA.begin();
+
   udp.begin(localPort);
   DebugSerialPrintf("El servidor UDP se inició en el puerto: %u\n", localPort);
   Wire.begin();
   Wire.setClock(400000);
   // setupIMU();
 
-  frontServo.attach(frontServoPin);
-  frontServo.write(90);
-  delay(500);
-
   pinMode(leftEncoderC1, INPUT_PULLUP);
   pinMode(leftEncoderC2, INPUT_PULLUP);
   pinMode(rightEncoderC1, INPUT_PULLUP);
   pinMode(rightEncoderC2, INPUT_PULLUP);
+
   attachInterrupt(digitalPinToInterrupt(leftEncoderC1), LeftWheelPulses, CHANGE);
   attachInterrupt(digitalPinToInterrupt(leftEncoderC2), LeftWheelPulses, CHANGE);
   attachInterrupt(digitalPinToInterrupt(rightEncoderC1), RightWheelPulses, CHANGE);
@@ -302,8 +442,10 @@ void setup() {
 
   pinMode(enableLeftInfraredSensor, OUTPUT);
   pinMode(enableRightInfraredSensor, OUTPUT);
+
   digitalWrite(enableLeftInfraredSensor, LOW);
   digitalWrite(enableRightInfraredSensor, LOW);
+
   pinMode(batteryStatus, INPUT);
   attachInterrupt(digitalPinToInterrupt(batteryStatus), LowBattery, FALLING);
   pinMode(leftInfraredSensor, INPUT);
@@ -333,12 +475,21 @@ void setup() {
  - READ_INSTRUCTION: Lee la siguiente instrucción de la lista de instrucciones.
  - MESSAGE_BASE: Envía un mensaje a la base con el estado del robot.
  - IDENTIFY_OBSTACLE: Identifica si el obstáculo detectado es otro robot o no.
+ - ACTIVE_EVASION: (No implementado en este fragmento)
+  - REQUEST_POSITION: Solicita la posición al robot base y maneja la respuesta.
 
 ***************************************************************************************/
 void loop() {
+  ledCtrl.update(); 
   WiFiStatus();
+   if (WiFi.status() != WL_CONNECTED) return;
   ReadUdpPackets();
   ReadSensors();
+  
+  #ifdef DebugSerial
+    ReadSerialCommands();
+  #endif
+
 
   switch (state) {
     case WAIT: {
@@ -479,29 +630,93 @@ void loop() {
 
       break;
     }
-  }
-}
+    
+    case ACTIVE_EVASION: {
 
+      break;
+    }
+
+    case REQUEST_POSITION: {
+      static unsigned long lastRequestTime = 0;
+      static bool waitingForResponse = false;
+      const unsigned long requestTimeout = 5000;
+
+      if (robots.find("Base") == robots.end() || robots["Base"] == IPAddress(0,0,0,0)) {
+        MessageDebugf("DEBUG: -1, ID: %s, No hay IP de base", robotID.c_str());
+        waitingForResponse = false;
+        lastRequestTime = 0;
+        state = WAIT;
+        instructionValue = 500;
+        break;
+      }
+
+      if (!waitingForResponse) {
+        SendMessage(robots["Base"], "REQUEST_POSITION");
+        MessageDebugf("DEBUG: -1, ID: %s, Solicitud enviada", robotID.c_str());
+        lastRequestTime = millis();
+        waitingForResponse = true;
+      }
+
+      // Verificar timeout
+      if (millis() - lastRequestTime > requestTimeout) {
+        MessageDebugf("DEBUG: -1, ID: %s, Timeout", robotID.c_str());
+        waitingForResponse = false;
+        lastRequestTime = 0;
+        state = WAIT;
+        instructionValue = 500;
+        break;
+      }
+
+    
+      if (positionReceived) {
+        MessageDebugf("DEBUG: -1, ID: %s, Respuesta recibida", robotID.c_str());
+        waitingForResponse = false;
+        lastRequestTime = 0;
+        positionReceived = false;  
+        state = WAIT;
+        instructionValue = 100;  
+      }
+      
+      break;
+    }
+
+  }
+
+}
 
 /***************************************************************************************
 
- Función que verifica el estado de la conexión Wi-Fi y espera hasta que el robot esté 
- conectado a la red. Durante la conexión, se apagan los motores y se indica el estado 
- de conexión a través de un parpadeo en los LEDs del strip.
+ Función que calcula el vector de movimiento hacia el líder durante la congregación.
+ Determina el ángulo y distancia necesarios para llegar a la posición del líder y 
+ agrega las instrucciones correspondientes (giro y movimiento) a la cola de instrucciones.
+
+ @param targetX Coordenada X del líder (objetivo)
+ @param targetY Coordenada Y del líder (objetivo)
 
 ***************************************************************************************/
-void WiFiStatus() {
-  while (WiFi.status() != WL_CONNECTED) {
-    ConfigureHBridge(0, 0);
-    DebugSerialPrintln("Conectando WiFi ...");
-    for (int brillo : { maxBrightness, 0 }) {
-      strip.setBrightness(brillo);
-      strip.setAllLedsColor(strip.Wheel(170));
-      delay(250);
+void CalculateAndQueueMovement(float targetX, float targetY) {
+    
+    float deltaX = targetX - robotPose.x;
+    float deltaY = targetY - robotPose.y;
+    float distance = sqrt(deltaX * deltaX + deltaY * deltaY);
+    float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
+    float angleDiff = targetAngle - robotPose.angle;
+    
+    while (angleDiff > 180) angleDiff -= 360;
+    while (angleDiff < -180) angleDiff += 360;
+    
+    if (abs(angleDiff) > 5) {
+        fsmInstruction[0] = TURN;
+        fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
+        instructionList.push_back(fsmInstruction);
     }
-  }
+    
+    if (distance > 80) {
+        fsmInstruction[0] = MOVE;
+        fsmInstruction[1] = distance - 80;
+        instructionList.push_back(fsmInstruction);
+    }
 }
-
 
 /***************************************************************************************
 
@@ -512,15 +727,116 @@ void WiFiStatus() {
 
 ***************************************************************************************/
 void SetupFrontSensor() {
-  while (!frontSensor.begin()) {
-    DebugSerialPrintln("Fallo la inialización del sensor APDS-9960.");
-    for (int brillo : { maxBrightness, 0 }) {
-      strip.setBrightness(brillo);
-      strip.setAllLedsColor(strip.Wheel(0));
-      delay(250);
+  static bool sensorInitialized = false;
+  static unsigned long lastAttempt = 0;
+  
+  if (sensorInitialized) return;
+  
+  unsigned long now = millis();
+  if (now - lastAttempt < 100) return;
+  
+  lastAttempt = now;
+  if (frontSensor.begin()) {
+    sensorInitialized = true;
+    ledCtrl.setOff();
+    DebugSerialPrintln("Sensor APDS-9960 inicializado correctamente");
+  } else {
+    DebugSerialPrintln("Fallo la inicialización del sensor APDS-9960.");
+    ledCtrl.setBlink(255, 0, 0, maxBrightness, 250);
+  }
+}
+
+/***************************************************************************************
+
+ Función que verifica el estado de la conexión Wi-Fi y espera hasta que el robot esté 
+ conectado a la red. Durante la conexión, se apagan los motores y se indica el estado 
+ de conexión a través de un parpadeo en los LEDs del strip.
+
+***************************************************************************************/
+void WiFiStatus() {
+  if (WiFi.status() != WL_CONNECTED) {
+    static bool wifiConnecting = false;
+    if (!wifiConnecting) {
+      ConfigureHBridge(0, 0);
+      DebugSerialPrintln("Conectando WiFi ...");
+      ledCtrl.setBlink(0, 255, 255, maxBrightness, 250); // Cian parpadeante
+      wifiConnecting = true;
+    }
+    return;
+  } else {
+    ledCtrl.setOff();
+  }
+}
+
+/***************************************************************************************
+
+Funcion selector del color del strip LED. 
+
+**************************************************************************************/
+void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
+  ledCtrl.setSolid(red, green, blue, maxBrightness);
+}
+
+/***************************************************************************************
+
+  Función para establecer el brillo del strip LED. 
+  
+  Esta función ajusta el brillo de los LEDs y actualiza la visualización.
+  
+  @param brightness El valor de brillo a establecer (0-255).
+
+**************************************************************************************/
+void setLedBrightness(uint8_t brightness) {
+  ledCtrl.brightness = brightness;
+  if (brightness == 0) ledCtrl.setOff();
+  else ledCtrl.currentState = LedController::SOLID;
+}
+
+void setLedBlink(uint8_t red, uint8_t green, uint8_t blue, unsigned long intervalMs = 250) {
+  ledCtrl.setBlink(red, green, blue, maxBrightness, intervalMs);
+}
+/***************************************************************************************
+
+  Función que lee los comandos enviados por el puerto serial y los procesa. 
+  Los comandos pueden ser "MOVE|valor", "TURN|valor" o "STOP". Dependiendo del comando, 
+  se actualiza la lista de instrucciones del robot y se envían mensajes de confirmación 
+  al puerto serial. Es solo de prueba y no se usa en el robot.
+
+***************************************************************************************/
+void ReadSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readString();
+    command.trim();
+    
+    int separatorIndex = command.indexOf('|');
+    String cmd = command.substring(0, separatorIndex);
+    String valueStr = command.substring(separatorIndex + 1);
+    int value = valueStr.toInt();
+    
+    if (cmd == "MOVE") {
+      fsmInstruction[0] = MOVE;
+      fsmInstruction[1] = value;
+      instructionList.push_back(fsmInstruction);
+      Serial.printf("Comando MOVE %d mm agregado\n", value);
+      
+    } else if (cmd == "TURN") {
+      fsmInstruction[0] = TURN;
+      fsmInstruction[1] = radians(value) * centerToWheelDistance;
+      instructionList.push_back(fsmInstruction);
+      Serial.printf("Comando TURN %d grados agregado\n", value);
+      
+    } else if (cmd == "STOP") {
+      instructionList.clear();
+      ConfigureHBridge(0, 0);
+      state = STOP;
+      Serial.println("Robot detenido");
+      
+    } else {
+      Serial.println("Comandos: MOVE|valor, TURN|valor, STOP");
     }
   }
 }
+
 
 
 /*******************************************************************************************
@@ -541,9 +857,7 @@ void CommunicationTest(){
       }
     }
   } else {
-    strip.setBrightness(255);
-    strip.setAllLedsColor(strip.Wheel(0));
-    delay(500);
+    ledCtrl.setSolid(255, 0, 0, 255); 
   }
 }
 
@@ -581,7 +895,6 @@ std::array<String, 5> SeparateCommand(const String& command, char delimiter) {
 
   return results;
 }
-
 
 /***************************************************************************************
 
@@ -733,7 +1046,7 @@ void ReadUdpPackets() {
     int servoAngle = constrain(arguments[1].toInt(), 5, 175);
     DebugSerialPrintf("Servo: %d°\n", servoAngle);
     frontServo.write(servoAngle);
-
+    
   } else if (command == "PID") {
     float kp = arguments[1].toFloat();
     float ki = arguments[2].toFloat();
@@ -765,6 +1078,16 @@ void ReadUdpPackets() {
     robotPose.y = arguments[2].toFloat();
     robotPose.angle = arguments[3].toFloat();
 
+  } else if (command == "SETPPR") {
+    float newPPR = arguments[1].toFloat();
+    if (newPPR > 100 && newPPR < 5000) {
+      pulsesPerRev = newPPR;
+      updateMillimetersPerPulse();
+      SendMessage(robots["Base"], "Pulsos por revolucion modificado");
+    } else {
+      SendMessage(robots["Base"], "Error: PPR debe estar entre 100-5000");
+    }
+    
   } else if (command == "CHECK_OBSTACLE") {
     int sensors = arguments[1].toInt();
     float x = arguments[2].toFloat();
@@ -798,9 +1121,98 @@ void ReadUdpPackets() {
     char buffer[50];
     snprintf(buffer, sizeof(buffer), "Robot ID: %s, Total messages: %d", robotID, countMessages);
     SendMessage(robots["Base"], buffer);
-  }
-}
 
+  } else if (command == "CONGREGATION") {
+    leaderID = arguments[1];
+    isLeader = (leaderID == robotID);
+    positionReceived = false;
+    hasGlobalTarget = false;
+
+    MessageDebugf("DEBUG: -1, ID: %s, Congregacion iniciada. Lider: %s", robotID, leaderID.c_str());
+
+    int delay = robotID.toInt() * 200; // Retraso basado en ID para evitar colisiones
+    fsmInstruction[0] = WAIT;
+    fsmInstruction[1] = delay;
+    instructionList.push_back(fsmInstruction);
+
+    fsmInstruction[0] = REQUEST_POSITION;
+    fsmInstruction[1] = 0;
+    instructionList.push_back(fsmInstruction);
+
+  } else if (command == "POSITIONGT") {
+    
+    float targetX = arguments[1].toFloat();
+    float targetY = arguments[2].toFloat();
+    
+    globalTargetX = targetX;
+    globalTargetY = targetY;
+    hasGlobalTarget = true;  
+    positionReceived = false;
+
+    MessageDebugf("DEBUG: -1, ID: %s, Objetivo global establecido: x=%.1f, y=%.1f", 
+                  robotID.c_str(), globalTargetX, globalTargetY);
+
+    fsmInstruction[0] = REQUEST_POSITION;
+    fsmInstruction[1] = 0;
+    instructionList.push_back(fsmInstruction);
+
+  } else if (command == "POSITION_RESPONSE") {
+    
+    robotPose.x = arguments[1].toFloat();
+    robotPose.y = arguments[2].toFloat();
+    robotPose.angle = arguments[3].toFloat();
+    positionReceived = true;
+
+    MessageDebugf("DEBUG: -1, ID: %s, Posicion recibida: x=%.1f, y=%.1f, angulo=%.1f", 
+                  robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
+
+    if (isLeader && leaderID != "-1") {
+      char buffer[64];
+      snprintf(buffer, sizeof(buffer), "LEADER_POSITION|%s|%.1f|%.1f", 
+                robotID.c_str(), robotPose.x, robotPose.y);
+      
+      if (robots.find("Broadcast") != robots.end()) {
+          SendMessage(robots["Broadcast"], buffer);
+          delayMicroseconds(500);
+          SendMessage(robots["Broadcast"], buffer);  
+          MessageDebugf("DEBUG: -1, ID: %s, Broadcasting posicion de lider", 
+                        robotID.c_str());
+      }
+    }
+    
+    if (hasGlobalTarget) {
+        CalculateAndQueueMovement(globalTargetX, globalTargetY);
+        hasGlobalTarget = false;
+        globalTargetX = 0;
+        globalTargetY = 0;
+    }
+  } else if (command == "LEADER_POSITION") {
+    String receivedLeaderID = arguments[1];
+
+    if (!isLeader && receivedLeaderID == leaderID) {
+        float leaderX = arguments[2].toFloat();
+        float leaderY = arguments[3].toFloat();
+        
+        if (positionReceived) {
+            MessageDebugf("DEBUG: -1, ID: %s, Procesando posicion del lider", robotID.c_str());
+            CalculateAndQueueMovement(leaderX, leaderY);
+        } else {
+            globalTargetX = leaderX;
+            globalTargetY = leaderY;
+            hasGlobalTarget = true;
+            MessageDebugf("DEBUG: -1, ID: %s, Guardando posicion del lider para despues", robotID.c_str());
+        }
+    }
+  } else if (command == "CANCEL_CONGREGATION") {
+    leaderID = "-1";
+    isLeader = false;
+    positionReceived = false;
+    hasGlobalTarget = false;
+    instructionList.clear();
+    state = STOP;
+    MessageDebugf("DEBUG: -1, ID: %s, Congregacion cancelada", robotID.c_str());
+  }
+} 
 
 /***************************************************************************************
 
@@ -844,16 +1256,13 @@ void ReadSensors() {
 
   if (debugUdp == 3) {
     if (leftObstacle || centralObstacle || rightObstacle) {
-      strip.setBrightness(maxBrightness);
-      strip.setAllLedsColor(strip.Wheel(200));
+      ledCtrl.setSolid(255, 128, 0, maxBrightness); // Naranja
     } else {
-      strip.setBrightness(0);
-      strip.setAllLedsColor(strip.Wheel(200));
+      ledCtrl.setOff();
     }
   } else {
     if ((digitalRead(batteryStatus) == LOW) && ((millis() - lowBatteryTime) >= minLowBatteryTime)) {
-      strip.setBrightness(255);
-      strip.setAllLedsColor(strip.Wheel(120));
+      ledCtrl.setSolid(255, 255, 0, 255); // Amarillo
     }
   }
 }
@@ -890,19 +1299,19 @@ void ResetPID() {
 ***************************************************************************************/
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
   if (leftWheelPWM >= 0) {
-    analogWrite(leftMotorBackward, 0);
-    analogWrite(leftMotorForward, leftWheelPWM);
-  } else if (leftWheelPWM < 0) {
-    analogWrite(leftMotorForward, 0);
-    analogWrite(leftMotorBackward, _abs(leftWheelPWM));
+    ledcWrite(leftMotorBackward, 0);
+    ledcWrite(leftMotorForward, leftWheelPWM);
+  } else {
+    ledcWrite(leftMotorForward, 0);
+    ledcWrite(leftMotorBackward, _abs(leftWheelPWM));
   }
 
   if (rightWheelPWM >= 0) {
-    analogWrite(rightMotorBackward, 0);
-    analogWrite(rightMotorForward, rightWheelPWM);
-  } else if (rightWheelPWM < 0) {
-    analogWrite(rightMotorForward, 0);
-    analogWrite(rightMotorBackward, _abs(rightWheelPWM));
+    ledcWrite(rightMotorBackward, 0);
+    ledcWrite(rightMotorForward, rightWheelPWM);
+  } else {
+    ledcWrite(rightMotorForward, 0);
+    ledcWrite(rightMotorBackward, _abs(rightWheelPWM));
   }
 }
 
@@ -1046,7 +1455,7 @@ void SendPose() {
   char buffer[40];
   snprintf(buffer, sizeof(buffer), message, obstacleSensors, robotPose.x, robotPose.y, robotPose.angle);
   SendMessage(robots["Broadcast"], buffer);
-  previousMillis - millis();
+  previousMillis = millis();
 }
 
 
@@ -1127,11 +1536,7 @@ void setupIMU() {
     imu.begin(Wire, AD0_VAL);
     if (imu.status != ICM_20948_Stat_Ok) {
       DebugSerialPrintln("Fallo inicializando la IMU, provando de nuevo...");
-      for (int brillo : { maxBrightness, 0 }) {
-        strip.setBrightness(brillo);
-        strip.setAllLedsColor(strip.Wheel(85));
-        delay(250);
-      }
+      ledCtrl.setSolid(255, 0, 0, maxBrightness);
     } else {
       success = true;
     }
@@ -1153,14 +1558,12 @@ void setupIMU() {
   if (!success) {
     DebugSerialPrintln("Fallo la inicializacion del DPM.");
     DebugSerialPrintln("Verifique que la linea 29 (#define ICM_20948_USE_DMP) de ICM_20948_C.h este sin comentar.");
-    strip.setBrightness(maxBrightness);
-    strip.setAllLedsColor(strip.Wheel(85));
+    ledCtrl.setSolid(0, 255, 0, maxBrightness); // Verde sólido para error DMP
   }
 
   if (!EEPROM.begin(128)) {
     DebugSerialPrintln("Fallo la inicializacion de la EEPROM.");
-    strip.setBrightness(maxBrightness);
-    strip.setAllLedsColor(strip.Wheel(0));
+    ledCtrl.setSolid(255, 0, 0, maxBrightness); // Rojo sólido para error EEPROM
   }
 
   EEPROM.get(0, store);
@@ -1177,13 +1580,13 @@ void setupIMU() {
 
     if (!success) {
       DebugSerialPrintln("No se pudo restaurar la calibracion de la IMU.");
-      strip.setBrightness(maxBrightness);
-      strip.setAllLedsColor(strip.Wheel(0));
+      //setLedBrightness(maxBrightness);
+      //setLedColor(0, 255, 0); // Verde
     }
   } else {
     DebugSerialPrintln("No se encontro una calibracion valida para la IMU.");
-    strip.setBrightness(maxBrightness);
-    strip.setAllLedsColor(strip.Wheel(0));
+    //setLedBrightness(maxBrightness);
+    //setLedColor(255, 0, 0); // Rojo
   }
 }
 
@@ -1382,7 +1785,7 @@ ICM_20948_Status_e ICM_20948::initializeDMP(void) {
   //  250dps : 2^25
   const unsigned char gyroFullScale[4] = { 0x10, 0x00, 0x00, 0x00 };
   result = writeDMPmems(GYRO_FULLSCALE, 4, &gyroFullScale[0]);
-  if (result > worstResult) worstResult = result;
+   if (result > worstResult) worstResult = result;
 
   // Configure the Accel Only Gain: 15252014 (225Hz) 30504029 (112Hz) 61117001 (56Hz)
   //const unsigned char accelOnlyGain[4] = {0x03, 0xA4, 0x92, 0x49}; // 56Hz
