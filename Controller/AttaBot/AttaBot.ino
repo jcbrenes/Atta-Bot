@@ -1,18 +1,20 @@
 #include "utils.h"
-#include <Adafruit_APDS9960.h> // Adafruit_APDS9960. v1.3.0
-#include <EEPROM.h>
-#include <FastLED.h> // FastLED by Daniel Garcia. v 3.10.2
-#include <ICM_20948.h> // SparkFun ICM-20948 Arduino Library. v1.2.12
-#include <ESP32Servo.h> // ESP32Servo Kevin Harrington v3.0.9
-//#include <ESPmDNS.h>
+#include <Adafruit_APDS9960.h> // v1.3.0
+#include <FastLED.h> // v3.10.2
+#include <ICM_20948.h> // v1.2.12
+#include <ESP32Servo.h> // v3.0.9
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <Wire.h>
-#include <deque>
-#include <map>
+#include <Preferences.h>
+#include <EEPROM.h>
 
-// Descomentar solo para debug !!!
+// ============================================================================
+// CONFIGURACIÓN DE DEBUG
+// ============================================================================
+
+// Descomentar solo para debug
 //#define DebugSerial
 #ifdef DebugSerial
   #define DebugSerialPrint(x) Serial.print(x)
@@ -23,6 +25,11 @@
   #define DebugSerialPrintln(x)
   #define DebugSerialPrintf(x, ...)
 #endif
+
+
+// ============================================================================
+// DEFINICIÓN DE PINES
+// ============================================================================
 
 #define leftMotorForward 12
 #define leftMotorBackward 14
@@ -43,66 +50,114 @@
 #define batteryStatus 19
 #define ledPin 2
 #define AD0_VAL 1
-#define NUM_LEDS 1  
+#define NUM_LEDS 1
 
 #define PWM_FREQ 1000
 #define PWM_RESOLUTION 14
-#define LEFT_MOTOR_FWD_CHANNEL 0
-#define LEFT_MOTOR_BWD_CHANNEL 1
-#define RIGHT_MOTOR_FWD_CHANNEL 2
-#define RIGHT_MOTOR_BWD_CHANNEL 3
 
-// Constantes para el WiFi
+
+// ============================================================================
+// CONSTANTES DEL SISTEMA
+// ============================================================================
+
+// WiFi
 const char* ssid = "Atta-Bot";
 const char* password = "attabot1234";
 const unsigned int localPort = 6060;
 char receivedPacket[255];
 
-// Constantes del robot empleado
-float pulsesPerRev = 820;             // Cantidad de pulsos por revolucion
-const float wheelCircumference = PI * 44.5;  // Diametro de la rueda = 44.5mm
-float millimetersPerPulse = wheelCircumference / (float)pulsesPerRev;
-const float centerToWheelDistance = 41.5;  // Radio de giro del carro, es la distancia en mm entre el centro y una rueda.
+// Constantes del robot
+float pulsesPerRev = 574;
+const float wheelCircumference = PI * 44.5;
+float millimetersPerPulse = wheelCircumference / pulsesPerRev;
+const float centerToWheelDistance = 41.5;
 
-// Muestreo velocidad
-const unsigned int samplingTime = 10;  // en ms
-const float samplingTimeS = (float)samplingTime * 0.001;
-unsigned long currentMillis = millis( );
-unsigned long previousMillis = millis();
-unsigned long previousMillisRW = 0;
+// Muestreo y velocidad
+const unsigned int samplingTime = 10;
+const float samplingTimeS = samplingTime * 0.001;
 const unsigned int SteadyStateTime = 800;
-unsigned long SteadyStatePreviousMillis = millis();
-int millisDifference;
-volatile int leftPulseCount = 0;
-volatile int rightPulseCount = 0;
-int pastLeftPulseCount = 0;
-int pastRightPulseCount = 0;
-int pastLeftEncoder = 0;
-int pastRightEncoder = 0;
-float currentLeftSpeed = 0.0;
-float currentRightSpeed = 0.0;
 const float distanceOffset = 1 * millimetersPerPulse;
+const float baseSpeed = millimetersPerPulse / samplingTimeS;
+const float maxSpeed = baseSpeed * 5;
+const float minSpeed = 12;
+const int speedReductionThreshold = 16;
 
-// Constantes para la implementación del control PID
-//const int pwmFrequency = 1000;
-//const int pwmResolution = 14;  // bits
+// Control PID
 const int maxPWMValue = (1 << PWM_RESOLUTION) - 1;
 const int minPWMValue = maxPWMValue * 0.20;
-const float baseSpeed = millimetersPerPulse / samplingTimeS;
-const float maxSpeed = baseSpeed * 5; // Unidades mm/s
-const float minSpeed = 12;
-const int speedReductionThreshold = 16; 
 pidConstants pidSpeed(110, 375, 2);
 kalmanFilter kfPID(6.0, 1.0, 1.0);
-pidController leftControl(kfPID, pidSpeed, samplingTimeS, minPWMValue, maxPWMValue);
-pidController rightControl(kfPID, pidSpeed, samplingTimeS, minPWMValue, maxPWMValue);
 
-const int observationPeriod = 28800; //us
-const int observationTime = 1600; //us
+// Sensores de obstáculos
+const int observationPeriod = 28800;
+const int observationTime = 1600;
 const int numberOfCycles = observationPeriod / observationTime;
 const int lateralCycle = random(numberOfCycles);
 const int centralCycle = (lateralCycle + random(1, numberOfCycles)) % numberOfCycles;
-const unsigned minObstacleTime = 1350; //us
+const unsigned minObstacleTime = 1350;
+
+// Detección de robots
+const float robotDistanceMargin = 260;
+const float maxRobotAngleMargin = 80;
+const int obstacleWaitTime = 600;
+const int reverseDistance = -40;
+
+// Debug
+int debugUdp = 0;
+int debugCounter = 0;
+char direction = '+';
+const char* debugMessage = "DEBUG: %d, ID: %s, Direccion: %c, val: Izq|Der, Encoder: %d|%d, Vel: %.2f|%.2f, Pwm: %d|%d, ErrorP: %.2f|%.2f, ErrorI: %.2f|%.2f, Dis: %.2f|%.2f, Tiempo: %d";
+
+// Random Walk
+const std::array<int, 7> possibleAngles = { 30, 45, 60, 75, 90, 135, 180 };
+const std::array<int, 4> possibleAdvances = { 200, 250, 300, 350 };
+enum possibleDirections { TURN_POS = 0, MOVE_FORWARD, TURN_NEG };
+
+// IMU
+const float gravity = 9806.65;
+const float conversionFactor = 8192.0;
+float yaw;
+float imuGravity;
+biasStore store;
+
+// LEDs
+int maxBrightness = 140;
+
+// Batería
+volatile unsigned long lowBatteryTime = 0;
+int minLowBatteryTime = 200;
+
+// Contador de mensajes
+int countMessages = 0;
+int sendMessages = 0;
+
+// Servo
+bool frontSensorInitialized = false;
+unsigned long lastFrontSensorAttempt = 0;
+const unsigned long frontSensorRetryInterval = 5000;  // Reintentar cada 5 segundos
+volatile bool lateralSensorsEnabled = false;
+
+
+// ============================================================================
+// VARIABLES GLOBALES REFACTORIZADAS (usando estructuras de utils.h)
+// ============================================================================
+
+NavigationTarget navTarget;
+InterruptionContext intContext;
+EvasionTracker evasionTracker;
+CongregationState congregation;
+ObstacleState obstacles;
+MovementMetrics movement;
+LedController ledCtrl;
+
+// Variables de control de movimiento
+unsigned long currentMillis = millis();
+unsigned long previousMillisRW = 0;
+int millisDifference;
+int pastLeftEncoder = 0;
+int pastRightEncoder = 0;
+
+// Variables de sensores
 unsigned long currentMicros = micros();
 unsigned long previousMicros = micros();
 bool isLateralCycleActive = false;
@@ -112,262 +167,130 @@ int microsDifference;
 volatile unsigned long leftObsStartTime = 0;
 volatile unsigned long rightObsStartTime = 0;
 unsigned long centralObsStartTime = 0;
-bool leftObstacle = false;
-bool centralObstacle = false;
-bool rightObstacle = false;
-bool obstacleDetected = false;
-int obstacleSensors;
 int centralDistance;
-const int reverseDistance = -40;  // mm
 
-
-int debugUdp = 0;
-int debugCounter = 0;
-char direction = '+';
-const char* debugMessage = "DEBUG: %d, ID: %s, Direccion: %c, val: Izq|Der, Encoder: %d|%d, Vel: %.2f|%.2f, Pwm: %d|%d, ErrorP: %.2f|%.2f, ErrorI: %.2f|%.2f, Dis: %.2f|%.2f, Tiempo: %d";
-
-// Variables para Congregacion
-String leaderID = "-1";
-bool isLeader = false;
-bool positionReceived = false;
-float globalTargetX = 0;
-float globalTargetY = 0;
-bool hasGlobalTarget = false;
-
+// Estado del robot
 String robotID = "-1";
 std::map<String, IPAddress> robots;
-
-enum PossibleStates { WAIT = 0,
-                      READ_INSTRUCTION,
-                      MOVE,
-                      TURN,
-                      STOP,
-                      REVERSE,
-                      RANDOM_WALK,
-                      MESSAGE_BASE,
-                      IDENTIFY_OBSTACLE,
-                      ACTIVE_EVASION, 
-                      REQUEST_POSITION                                 
-                      };
-
-PossibleStates state = WAIT;
+RobotState state = WAIT;
 float instructionValue = 100;
 bool movementReady = true;
 const int instructionCompletedDelay = 400;
 std::array<float, 2> fsmInstruction;
 std::deque<std::array<float, 2>> instructionList;
-
-const std::array<int, 7> possibleAngles = { 30, 45, 60, 75, 90, 135, 180 };
-const std::array<int, 4> possibleAdvances = { 200, 250, 300, 350 };
-enum possibleDirections { TURN_POS = 0,
-                          MOVE_FORWARD,
-                          TURN_NEG };
-
-const float gravity = 9806.65;
-const float conversionFactor = 8192.0;
-float yaw;
-float imuGravity;
-biasStore store;
-
-int maxBrightness = 140;
-
-volatile unsigned long lowBatteryTime = 0;
-int minLowBatteryTime = 200;
-
-float robotDistanceMargin = 260;
-float maxRobotAngleMargin = 80;
-bool robotDetected = false;
-String fromRobotID = "";
-const int obstacleWaitTime = 600;
 pose robotPose(0, 0, 0);
 
-int countMessages = 0;
-int sendMessages = 0;
+// Evasión
+bool isEvading = false;
+unsigned long evasionStartTime = 0;
+const unsigned long evasionCooldown = 2000;
+bool resumeScheduled = false;
+bool obstacleDetected = false;
 
+// Controladores PID
+pidController leftControl(kfPID, pidSpeed, samplingTimeS, minPWMValue, maxPWMValue);
+pidController rightControl(kfPID, pidSpeed, samplingTimeS, minPWMValue, maxPWMValue);
+
+// Hardware
 Servo frontServo;
 Adafruit_APDS9960 frontSensor;
 CRGB leds[NUM_LEDS];
 WiFiUDP udp;
 ICM_20948_I2C imu;
+Preferences preferences;
 
-// Estructura para control no bloqueante de LEDs
-struct LedController {
-  enum State { OFF, SOLID, BLINKING };
-  State currentState = OFF;
-  uint8_t red = 0, green = 0, blue = 0, brightness = 0;
-  unsigned long lastUpdate = 0, interval = 500;
-  bool blinkState = false;
-  
-  void update() {
-    unsigned long now = millis();
-    switch (currentState) {
-      case OFF:
-        if (brightness != 0) { 
-          brightness = 0;
-          FastLED.setBrightness(0); 
-          FastLED.show(); 
-        }
-      break;
-      case SOLID:
-        if (now - lastUpdate > 50) { 
-          leds[0] = CRGB(red, green, blue); 
-          FastLED.setBrightness(brightness); 
-          FastLED.show(); lastUpdate = now; 
-        }
-        break;
-      case BLINKING:
-        if (now - lastUpdate >= interval) { 
-          blinkState = !blinkState;
-          if (blinkState) { 
-            leds[0] = CRGB(red, green, blue); 
-            FastLED.setBrightness(brightness); 
 
-          } else { FastLED.setBrightness(0); } 
-            
-          FastLED.show(); lastUpdate = now; 
-        }
-        break;
-    }
-  }
-  
-  void setSolid(uint8_t r, uint8_t g, uint8_t b, uint8_t bright = 255) { red = r; green = g; blue = b; brightness = bright; currentState = SOLID; }
-  void setBlink(uint8_t r, uint8_t g, uint8_t b, uint8_t bright = 255, unsigned long intervalMs = 250) { red = r; green = g; blue = b; brightness = bright; interval = intervalMs; currentState = BLINKING; lastUpdate = 0; }
-  void setOff() { currentState = OFF; }
-};
-
-LedController ledCtrl;
-
-// ============================================
+// ============================================================================
 // DECLARACIONES FORWARD DE FUNCIONES
-// ============================================
+// ============================================================================
 
-// Funciones de configuración y control
+// Setup y configuración
 void SetupFrontSensor();
 void WiFiStatus();
 void setupIMU();
 void updateMillimetersPerPulse();
+void InitializePPR();
+void SavePPR(float newPPR);
 
-// Funciones de comunicación
+// Comunicación
 void ReadUdpPackets();
 void SendMessage(IPAddress host, const char* message);
 void SendPose();
 void MessageDebugf(const char* format, ...);
 void CommunicationTest();
 
-// Funciones de sensores y control
+// Sensores y control
 void ReadSensors();
 void ResetPID();
 void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM);
 
-// Funciones de movimiento
+// Movimiento
 bool MoveDistanceByWheel(float leftDistance, float rightDistance);
 float DesiredSpeed(float distance, float wheelDistance);
 bool IsStationary(float currentLeftSpeed, float currentRightSpeed, float leftWheelDistance, float rightWheelDistance);
 void SelectMovementRW();
 
-// Funciones auxiliares
+// Navegación iterativa
+void InitiateIterativeNavigation(float targetX, float targetY);
+void CalculateIterativeMovement();
+
+// Auxiliares
 std::array<String, 5> SeparateCommand(const String& command, char delimiter);
 bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id);
-void CalculateAndQueueMovement(float targetX, float targetY);
 void ReadSerialCommands();
 
-// Funciones de LED
+// LED
 void setLedColor(uint8_t red, uint8_t green, uint8_t blue);
 void setLedBrightness(uint8_t brightness);
 void setLedBlink(uint8_t red, uint8_t green, uint8_t blue, unsigned long intervalMs);
 
-// Funciones IMU
+// IMU
 bool StoreValido(biasStore* store);
 void LeerYaw();
 
-// ============================================
-// FIN DE DECLARACIONES FORWARD
-// ============================================
 
-/*****************************************************************************************
+// ============================================================================
+// INTERRUPCIONES (ISR)
+// ============================================================================
 
- Función que cuenta los pulsos del encoder de la rueda izquierda y determina la dirección
- del movimiento de la rueda (horario o antihorario) basándose en el cambio de estados 
- de los pines del encoder. 
-
- Utiliza `IRAM_ATTR` para que la función se ejecute en una interrupción, lo cual 
- garantiza una actualización rápida y eficiente de los pulsos de la rueda.
-
-*****************************************************************************************/
 void IRAM_ATTR LeftWheelPulses() {
   int MSB = digitalRead(leftEncoderC2);
   int LSB = digitalRead(leftEncoderC1);
   int encoder = (MSB << 1) | LSB;
   int sum = (pastLeftEncoder << 2) | encoder;
   if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
-    leftPulseCount++;
+    movement.leftPulseCount++;
   } else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
-    leftPulseCount--;
+    movement.leftPulseCount--;
   }
   pastLeftEncoder = encoder;
 }
 
-
-/***************************************************************************************
-
- Función que cuenta los pulsos del encoder de la rueda derecha y determina la dirección
- del movimiento de la rueda (horario o antihorario) basándose en el cambio de estados 
- de los pines del encoder.
-
- Utiliza `IRAM_ATTR` para que la función se ejecute en una interrupción, lo cual 
- garantiza una actualización rápida y eficiente de los pulsos de la rueda.
-
-***************************************************************************************/
 void IRAM_ATTR RightWheelPulses() {
   int MSB = digitalRead(rightEncoderC1);
   int LSB = digitalRead(rightEncoderC2);
   int encoder = (MSB << 1) | LSB;
   int sum = (pastRightEncoder << 2) | encoder;
   if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
-    rightPulseCount++;
+    movement.rightPulseCount++;
   } else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
-    rightPulseCount--;
+    movement.rightPulseCount--;
   }
   pastRightEncoder = encoder;
 }
 
-
-/********************************************************************************************
-
- Función que detecta un obstáculo en la izquierda del robot utilizando un sensor infrarrojo.
-
- Utiliza `IRAM_ATTR` para que la función se ejecute en una interrupción, lo cual 
- garantiza una actualización rápida y eficiente del esado del sensor.
-
-********************************************************************************************/
 void IRAM_ATTR DetectLeftObstacle() {
-  if (digitalRead(leftInfraredSensor) == LOW) {
+  if (lateralSensorsEnabled && digitalRead(leftInfraredSensor) == LOW) {
     leftObsStartTime = micros();
   }
 }
 
-
-/******************************************************************************************
-
- Función que detecta un obstáculo en la derecha del robot utilizando un sensor infrarrojo.
-
- Utiliza `IRAM_ATTR` para que la función se ejecute en una interrupción, lo cual 
- garantiza una actualización rápida y eficiente del esado del sensor.
-
-******************************************************************************************/
 void IRAM_ATTR DetectRightObstacle() {
-  if (digitalRead(rightInfraredSensor) == LOW) {
+  if (lateralSensorsEnabled && digitalRead(rightInfraredSensor) == LOW) {
     rightObsStartTime = micros();
   }
 }
 
-
-/***************************************************************************************
-
- Función que verifica el estado de la batería y registra el tiempo desde que la 
- batería es baja.
-
-***************************************************************************************/
 void LowBattery() {
   if (digitalRead(batteryStatus) == LOW) {
     lowBatteryTime = millis();
@@ -375,25 +298,43 @@ void LowBattery() {
 }
 
 
-/***************************************************************************************
+// ============================================================================
+// FUNCIONES DE SETUP Y CONFIGURACIÓN
+// ============================================================================
 
-Funcion que actualiza el valor de millimetersPerPulse en caso de que se modifique el valor
-mediante paquetes UDP.
+void InitializePPR() {
+  preferences.begin("attabot-config", false);
+  
+  float storedPPR = preferences.getFloat("ppr", 0);
+  
+  if (storedPPR == 0) {
+    preferences.putFloat("ppr", pulsesPerRev);
+    DebugSerialPrintf("PPR inicial guardado: %.2f\n", pulsesPerRev);
+  } else {
+    pulsesPerRev = storedPPR;
+    DebugSerialPrintf("PPR cargado desde memoria: %.2f\n", pulsesPerRev);
+  }
+  
+  updateMillimetersPerPulse();
+  preferences.end();
+  
+  uint64_t chipid = ESP.getEfuseMac();
+  DebugSerialPrintf("Robot Chip ID: %04X%08X\n", 
+                    (uint16_t)(chipid>>32), 
+                    (uint32_t)chipid);
+}
 
-**************************************************************************************/
+void SavePPR(float newPPR) {
+  preferences.begin("attabot-config", false);
+  preferences.putFloat("ppr", newPPR);
+  preferences.end();
+  DebugSerialPrintf("PPR guardado permanentemente: %.2f\n", newPPR);
+}
+
 void updateMillimetersPerPulse() {
   millimetersPerPulse = wheelCircumference / pulsesPerRev;
 }
 
-
-/***************************************************************************************
-
- Función de configuración del robot que se ejecuta una vez al inicio del programa.
- Esta función inicializa los componentes del robot, configura las interrupciones, 
- establece la comunicación Wi-Fi y el servidor UDP, y ajusta la configuración de 
- sensores y motores.
-
-***************************************************************************************/
 void setup() {
   #ifdef DebugSerial
     Serial.begin(115200);
@@ -401,8 +342,7 @@ void setup() {
   
   frontServo.setPeriodHertz(50);
   frontServo.attach(frontServoPin, 1000, 2000);
-  frontServo.write(90);  
-  delay(100); 
+  frontServo.write(90);
 
   ledcAttach(leftMotorForward, PWM_FREQ, PWM_RESOLUTION);
   ledcAttach(leftMotorBackward, PWM_FREQ, PWM_RESOLUTION);
@@ -414,12 +354,11 @@ void setup() {
 
   String hostname = "AttaBot-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   WiFi.setHostname(hostname.c_str());
- 
 
   FastLED.addLeds<WS2812, ledPin, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(maxBrightness);
-  FastLED.setMaxRefreshRate(120); 
-  ledCtrl.setOff(); 
+  FastLED.setMaxRefreshRate(120);
+  ledCtrl.setOff();
 
   ArduinoOTA.setHostname(hostname.c_str());
   ArduinoOTA.begin();
@@ -428,7 +367,7 @@ void setup() {
   DebugSerialPrintf("El servidor UDP se inició en el puerto: %u\n", localPort);
   Wire.begin();
   Wire.setClock(400000);
-  // setupIMU();
+  InitializePPR();
 
   pinMode(leftEncoderC1, INPUT_PULLUP);
   pinMode(leftEncoderC2, INPUT_PULLUP);
@@ -458,45 +397,28 @@ void setup() {
 }
 
 
-/***************************************************************************************
+// ============================================================================
+// LOOP PRINCIPAL
+// ============================================================================
 
- Función principal del programa que gestiona el ciclo de operación del robot.
- Esta función es responsable de controlar el flujo de acciones del robot, que incluye
- la lectura de paquetes UDP, la verificación de sensores y la gestión de estados 
- a través de una maquina de estados (FSM).
-
- Dependiendo del estado actual del robot, se ejecutan diferentes acciones:
- - WAIT: Espera instrucciones y reinicia el PID si es necesario.
- - MOVE: Mueve el robot una distancia especificada.
- - TURN: Realiza un giro a una distancia especificada.
- - RANDOM_WALK: Ejecuta el comportamiento de exploracion aleatoria
- - REVERSE: Retrocede si se detecta un obstáculo.
- - STOP: Detiene el movimiento y evalúa el siguiente estado.
- - READ_INSTRUCTION: Lee la siguiente instrucción de la lista de instrucciones.
- - MESSAGE_BASE: Envía un mensaje a la base con el estado del robot.
- - IDENTIFY_OBSTACLE: Identifica si el obstáculo detectado es otro robot o no.
- - ACTIVE_EVASION: (No implementado en este fragmento)
-  - REQUEST_POSITION: Solicita la posición al robot base y maneja la respuesta.
-
-***************************************************************************************/
 void loop() {
-  ledCtrl.update(); 
+  ledCtrl.update();
   WiFiStatus();
-   if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) return;
   ReadUdpPackets();
   ReadSensors();
+  SetupFrontSensor(); 
   
   #ifdef DebugSerial
     ReadSerialCommands();
   #endif
 
-
   switch (state) {
     case WAIT: {
       ArduinoOTA.handle();
 
-      if ((millis() - previousMillis) >= instructionValue) {
-        previousMillis = millis();
+      if ((millis() - movement.previousMillis) >= instructionValue) {
+        movement.previousMillis = millis();
         ResetPID();
         if (movementReady) {
           state = READ_INSTRUCTION;
@@ -513,11 +435,29 @@ void loop() {
       movementReady = MoveDistanceByWheel(instructionValue, instructionValue);
 
       if (movementReady) {
-        MessageDebugf("DEBUG: -1, ID: %s, Movimiento completado", robotID);
+        MessageDebugf("DEBUG: -1, ID: %s, Movimiento completado", robotID.c_str());
+        intContext.Clear();
+        isEvading = false;
         state = STOP;
-      } else if (leftObstacle || centralObstacle || rightObstacle) {
-        obstacleSensors = (leftObstacle << 2) | (centralObstacle << 1) | rightObstacle; 
-        state = STOP;
+          
+      } else if (obstacles.HasAnyObstacle() && !isEvading) {
+          obstacles.UpdateBitmap();
+          
+          intContext.wasInterrupted = true;
+          intContext.previousState = MOVE;
+          intContext.leftPulsesBeforeStop = movement.pastLeftPulseCount;
+          intContext.rightPulsesBeforeStop = movement.pastRightPulseCount;
+          
+          float avgTraveled = (movement.pastLeftPulseCount + movement.pastRightPulseCount) / 2.0 * millimetersPerPulse;
+          intContext.remainingValue = instructionValue - avgTraveled;
+
+          isEvading = true;
+          evasionStartTime = millis();
+          
+          MessageDebugf("DEBUG: -1, ID: %s, MOVE interrumpido: restante=%.1fmm", 
+                        robotID.c_str(), intContext.remainingValue);
+          
+          state = STOP;
       }
 
       break;
@@ -527,10 +467,32 @@ void loop() {
       movementReady = MoveDistanceByWheel(instructionValue, -instructionValue);
 
       if (movementReady) {
-        MessageDebugf("DEBUG: -1, ID: %s, Giro completado", robotID);
+        MessageDebugf("DEBUG: -1, ID: %s, Giro completado", robotID.c_str());
+        intContext.Clear();
+        isEvading = false;
         state = STOP;
-      } else if (leftObstacle || centralObstacle || rightObstacle) {
-        obstacleSensors = (leftObstacle << 2) | (centralObstacle << 1) | rightObstacle;
+          
+      } else if (obstacles.HasAnyObstacle() && !isEvading) {
+        obstacles.UpdateBitmap();
+        
+        intContext.wasInterrupted = true;
+        intContext.previousState = TURN;
+        intContext.leftPulsesBeforeStop = movement.pastLeftPulseCount;
+        
+        float traveled = movement.pastLeftPulseCount * millimetersPerPulse;
+        intContext.remainingValue = instructionValue - traveled;
+
+        isEvading = true;
+        evasionStartTime = millis();
+        
+        float angleRemaining = (intContext.remainingValue / centerToWheelDistance) * RAD_TO_DEG;
+        MessageDebugf("DEBUG: -1, ID: %s, TURN interrumpido: restante=%.1f°", 
+                      robotID.c_str(), angleRemaining);
+
+        if (obstacles.centralObstacle) {
+          movementReady = false;
+        }
+        
         state = STOP;
       }
 
@@ -552,10 +514,8 @@ void loop() {
         SelectMovementRW();
       } else {
         previousMillisRW = 0;
-        MessageDebugf("DEBUG: -1, ID: %s, Random Walk terminado", robotID);
+        MessageDebugf("DEBUG: -1, ID: %s, Random Walk terminado", robotID.c_str());
       }
-
-      // CommunicationTest();
 
       state = READ_INSTRUCTION;
       break;
@@ -565,9 +525,13 @@ void loop() {
       movementReady = MoveDistanceByWheel(reverseDistance, reverseDistance);
 
       if (movementReady) {
-        obstacleDetected = true;
-        MessageDebugf("DEBUG: -1, ID: %s, Obstaculo evitado", robotID);
-        state = STOP;
+          obstacleDetected = true;
+          MessageDebugf("DEBUG: -1, ID: %s, Retroceso completado", robotID.c_str());
+          state = STOP;
+      }
+      else if (obstacles.HasAnyObstacle() && !isEvading) {
+          MessageDebugf("DEBUG: -1, ID: %s, Obstáculo durante retroceso!", robotID.c_str());
+          state = STOP;
       }
 
       break;
@@ -575,9 +539,16 @@ void loop() {
 
     case STOP: {
       ConfigureHBridge(0, 0);
+      
       if (movementReady == true) {
+        if (!intContext.wasInterrupted) {
+          isEvading = false;
+          resumeScheduled = false;
+        }
+        
         state = WAIT;
         instructionValue = instructionCompletedDelay;
+          
       } else {
         SendPose();
         state = IDENTIFY_OBSTACLE;
@@ -587,11 +558,16 @@ void loop() {
     }
 
     case READ_INSTRUCTION: {
+      if (!isEvading && !intContext.wasInterrupted) {
+
+        obstacles.Clear();
+      }
+      
       if (!instructionList.empty()) {
         fsmInstruction = instructionList.front();
         instructionList.pop_front();
         instructionValue = fsmInstruction[1];
-        state = static_cast<PossibleStates>(fsmInstruction[0]);
+        state = static_cast<RobotState>(fsmInstruction[0]);
         direction = instructionValue > 0 ? '+' : '-';
 
       } else {
@@ -617,149 +593,418 @@ void loop() {
 
     case IDENTIFY_OBSTACLE: {
       currentMillis = millis();
-      if (robotDetected) {
+      if (obstacles.robotDetected) {
         state = WAIT;
         instructionValue = instructionCompletedDelay / 2;
-        MessageDebugf("DEBUG: -1, ID: %s, Obstaculo encontrado es robot id: %s", robotID, fromRobotID);
-      } else if ((currentMillis - previousMillis) >= obstacleWaitTime) {
-        previousMillis = currentMillis;
-        state = WAIT;
+        MessageDebugf("DEBUG: -1, ID: %s, Obstáculo encontrado es robot id: %s", 
+                     robotID.c_str(), obstacles.fromRobotID.c_str());
+      } else if ((currentMillis - movement.previousMillis) >= obstacleWaitTime) {
+        movement.previousMillis = currentMillis;
+        state = ACTIVE_EVASION;
         instructionValue = 0;
-        MessageDebugf("DEBUG: -1, ID: %s, Obstaculo encontrado no es un robot", robotID);
+        MessageDebugf("DEBUG: -1, ID: %s, Obstáculo encontrado no es un robot", robotID.c_str());
       }
-
-      break;
-    }
-    
-    case ACTIVE_EVASION: {
 
       break;
     }
 
     case REQUEST_POSITION: {
-      static unsigned long lastRequestTime = 0;
-      static bool waitingForResponse = false;
-      const unsigned long requestTimeout = 5000;
-
       if (robots.find("Base") == robots.end() || robots["Base"] == IPAddress(0,0,0,0)) {
         MessageDebugf("DEBUG: -1, ID: %s, No hay IP de base", robotID.c_str());
-        waitingForResponse = false;
-        lastRequestTime = 0;
+        congregation.CompleteRequest();
+        
+        if (navTarget.isActive) {
+          MessageDebugf("DEBUG: -1, ID: %s, Abortando navegación por falta de base", 
+                        robotID.c_str());
+          navTarget.Reset();
+        }
+        
         state = WAIT;
         instructionValue = 500;
         break;
       }
 
-      if (!waitingForResponse) {
+      if (!congregation.waitingForResponse) {
         SendMessage(robots["Base"], "REQUEST_POSITION");
-        MessageDebugf("DEBUG: -1, ID: %s, Solicitud enviada", robotID.c_str());
-        lastRequestTime = millis();
-        waitingForResponse = true;
+        MessageDebugf("DEBUG: -1, ID: %s, Solicitud enviada (iteración %d)", 
+                      robotID.c_str(), navTarget.currentIteration);
+        congregation.StartRequest();
       }
 
-      // Verificar timeout
-      if (millis() - lastRequestTime > requestTimeout) {
-        MessageDebugf("DEBUG: -1, ID: %s, Timeout", robotID.c_str());
-        waitingForResponse = false;
-        lastRequestTime = 0;
+      if (congregation.HasTimedOut()) {
+        MessageDebugf("DEBUG: -1, ID: %s, Timeout en REQUEST_POSITION", robotID.c_str());
+        congregation.CompleteRequest();
+        
+        if (navTarget.isActive && navTarget.currentIteration < navTarget.maxIterations) {
+          fsmInstruction[0] = REQUEST_POSITION;
+          fsmInstruction[1] = 0;
+          instructionList.push_back(fsmInstruction);
+          MessageDebugf("DEBUG: -1, ID: %s, Reintentando REQUEST_POSITION", 
+                        robotID.c_str());
+        } else {
+          navTarget.Reset();
+        }
+        
         state = WAIT;
         instructionValue = 500;
         break;
       }
 
-    
-      if (positionReceived) {
+      if (congregation.positionReceived) {
         MessageDebugf("DEBUG: -1, ID: %s, Respuesta recibida", robotID.c_str());
-        waitingForResponse = false;
-        lastRequestTime = 0;
-        positionReceived = false;  
-        state = WAIT;
-        instructionValue = 100;  
+        congregation.CompleteRequest();
+        congregation.positionReceived = false;
+        state = READ_INSTRUCTION;
+        instructionValue = 0;
       }
       
       break;
     }
 
-  }
+    case ACTIVE_EVASION: {
+      // Validación 1: Verificar que hay un obstáculo válido
+      if (obstacles.obstacleSensors == 0 || !obstacles.HasAnyObstacle()) {
+        MessageDebugf("DEBUG: -1, ID: %s, ⚠️ ACTIVE_EVASION sin obstáculo válido. Abortando.", 
+                      robotID.c_str());
+        obstacles.Clear();
+        state = READ_INSTRUCTION;
+        break;
+      }
+      
+      // Validación 2: Verificar que los datos no sean muy antiguos
+      unsigned long timeSinceDetection = millis() - evasionStartTime;
+      if (timeSinceDetection > 1500) {
+        MessageDebugf("DEBUG: -1, ID: %s, ⚠️ Datos de obstáculo obsoletos (%lums). Re-escaneando.", 
+                      robotID.c_str(), timeSinceDetection);
+        state = STOP;  // Volver a escanear
+        break;
+      }
+      
+      evasionTracker.RecordEvasion();
+      
+      int avoidanceDistance = 0;
+      int avoidanceAngle = 0;
+      bool needsRetreat = evasionTracker.ShouldRetreat();
+      
+      if (needsRetreat) {
+        MessageDebugf("DEBUG: -1, ID: %s, 🔴 Ejecutando retroceso forzado (evasiones: %d)", 
+                      robotID.c_str(), evasionTracker.consecutiveEvasions);
+        
+        std::deque<std::array<float, 2>> retreatSequence;
+        
+        fsmInstruction[0] = REVERSE;
+        fsmInstruction[1] = reverseDistance * 3;
+        retreatSequence.push_back(fsmInstruction);
+        
+        fsmInstruction[0] = TURN;
+        fsmInstruction[1] = radians(random(2) ? 180 : -180) * centerToWheelDistance;
+        retreatSequence.push_back(fsmInstruction);
+        
+        fsmInstruction[0] = MOVE;
+        fsmInstruction[1] = 300;
+        retreatSequence.push_back(fsmInstruction);
+        
+        for (auto it = retreatSequence.rbegin(); it != retreatSequence.rend(); ++it) {
+          instructionList.push_front(*it);
+        }
+        
+        evasionTracker.Reset();
+        
+      } else {
+        // Estrategia de evasión basada en patrón de sensores
+        if (obstacles.obstacleSensors == 0b100) {  // Solo izquierda
+          avoidanceAngle = 45;
+          avoidanceDistance = 200;
+        } else if (obstacles.obstacleSensors == 0b001) {  // Solo derecha
+          avoidanceAngle = -45;
+          avoidanceDistance = 200;
+        } else if (obstacles.obstacleSensors == 0b010) {  // Solo central
+          avoidanceAngle = (random(2) == 0) ? 60 : -60;
+          avoidanceDistance = 250;
+        } else if (obstacles.obstacleSensors == 0b110) {  // Izquierda + Central
+          avoidanceAngle = 90;
+          avoidanceDistance = 150;
+        } else if (obstacles.obstacleSensors == 0b011) {  // Central + Derecha
+          avoidanceAngle = -90;
+          avoidanceDistance = 150;
+        } else if (obstacles.obstacleSensors == 0b111) {  // Todos
+          avoidanceAngle = (random(2) == 0) ? 135 : -135;
+          avoidanceDistance = 100;
+        }
+        
+        std::deque<std::array<float, 2>> evasionSequence;
+        
+        // Retroceso si hay obstáculo frontal
+        if (obstacles.obstacleSensors & 0b010 || obstacles.obstacleSensors == 0b111) {
+          fsmInstruction[0] = REVERSE;
+          fsmInstruction[1] = reverseDistance * 1.5;
+          evasionSequence.push_back(fsmInstruction);
+        }
+        
+        // Giro de evasión
+        if (avoidanceAngle != 0) {
+          fsmInstruction[0] = TURN;
+          fsmInstruction[1] = radians(avoidanceAngle) * centerToWheelDistance;
+          evasionSequence.push_back(fsmInstruction);
+        }
+        
+        // Avance para despejar
+        if (avoidanceDistance > 0) {
+          fsmInstruction[0] = MOVE;
+          fsmInstruction[1] = avoidanceDistance;
+          evasionSequence.push_back(fsmInstruction);
+        }
+        
+        for (auto it = evasionSequence.rbegin(); it != evasionSequence.rend(); ++it) {
+          instructionList.push_front(*it);
+        }
+      }
+      
+      // Programar resumption si fue interrumpido
+      if (intContext.wasInterrupted && !resumeScheduled) {
+        fsmInstruction[0] = RESUME_AFTER_EVASION;
+        fsmInstruction[1] = 0;
+        instructionList.push_back(fsmInstruction);
+        resumeScheduled = true;
+      }
+      
+      // NO borrar obstacles aquí - se borra en próximo READ_INSTRUCTION
+      obstacleDetected = false;
+      
+      state = READ_INSTRUCTION;
+      
+      MessageDebugf("DEBUG: -1, ID: %s, ✅ Evasión: patrón=%s, giro=%d°, avance=%dmm, forzado=%d", 
+                    robotID.c_str(), 
+                    obstacles.GetObstaclePattern().c_str(),
+                    avoidanceAngle, 
+                    avoidanceDistance, 
+                    needsRetreat);
+      
+      break;
+    }
 
+    case RESUME_AFTER_EVASION: {
+      if (!intContext.wasInterrupted) {
+        resumeScheduled = false;
+        obstacles.Clear();  // Ahora sí limpiamos
+        state = READ_INSTRUCTION;
+        break;
+      }
+      
+      MessageDebugf("DEBUG: -1, ID: %s, 🔄 Resumiendo: estado=%d, valor=%.1f, navActive=%d", 
+                    robotID.c_str(), 
+                    intContext.previousState, 
+                    intContext.remainingValue,
+                    navTarget.isActive);
+      
+      // IMPORTANTE: Si hay navegación activa, NO reanudar con valores absolutos
+      // Siempre recalcular desde posición actual
+      if (navTarget.isActive) {
+        MessageDebugf("DEBUG: -1, ID: %s, ℹ️ Navegación activa: recalculando ruta en lugar de reanudar", 
+                      robotID.c_str());
+        
+        // Ir directo a REQUEST_POSITION para recalcular
+        fsmInstruction[0] = REQUEST_POSITION;
+        fsmInstruction[1] = 0;
+        instructionList.push_front(fsmInstruction);
+        
+      } else {
+        // Solo reanudar si NO es navegación iterativa
+        switch (intContext.previousState) {
+          case MOVE: {
+            if (intContext.remainingValue > 20) {
+              fsmInstruction[0] = MOVE;
+              fsmInstruction[1] = intContext.remainingValue;
+              instructionList.push_front(fsmInstruction);
+              
+              MessageDebugf("DEBUG: -1, ID: %s, ↪️ Reanudando MOVE: %.1fmm restantes", 
+                            robotID.c_str(), intContext.remainingValue);
+            }
+            break;
+          }
+            
+          case TURN: {
+            float angleRemaining = abs((intContext.remainingValue / centerToWheelDistance) * RAD_TO_DEG);
+            if (angleRemaining > 5) {
+              fsmInstruction[0] = TURN;
+              fsmInstruction[1] = intContext.remainingValue;
+              instructionList.push_front(fsmInstruction);
+              
+              MessageDebugf("DEBUG: -1, ID: %s, ↪️ Reanudando TURN: %.1f° restantes", 
+                            robotID.c_str(), angleRemaining);
+            }
+            break;
+          }
+        }
+      }
+      
+      intContext.Clear();
+      resumeScheduled = false;
+      isEvading = false;
+      obstacles.Clear();  // Limpiar ahora
+      
+      // Resetear evasion tracker con cooldown
+      evasionTracker.Reset();
+      
+      state = READ_INSTRUCTION;
+      break;
+    }
+  }
 }
 
-/***************************************************************************************
 
- Función que calcula el vector de movimiento hacia el líder durante la congregación.
- Determina el ángulo y distancia necesarios para llegar a la posición del líder y 
- agrega las instrucciones correspondientes (giro y movimiento) a la cola de instrucciones.
+// ============================================================================
+// FUNCIONES DE NAVEGACIÓN ITERATIVA
+// ============================================================================
 
- @param targetX Coordenada X del líder (objetivo)
- @param targetY Coordenada Y del líder (objetivo)
-
-***************************************************************************************/
-void CalculateAndQueueMovement(float targetX, float targetY) {
+void InitiateIterativeNavigation(float targetX, float targetY) {
+    navTarget.targetX = targetX;
+    navTarget.targetY = targetY;
+    navTarget.StartNavigation();  // Usa el nuevo método
     
-    float deltaX = targetX - robotPose.x;
-    float deltaY = targetY - robotPose.y;
-    float distance = sqrt(deltaX * deltaX + deltaY * deltaY);
+    MessageDebugf("DEBUG: -1, ID: %s, 🎯 Navegación iterativa iniciada: objetivo=(%.1f, %.1f)", 
+                  robotID.c_str(), targetX, targetY);
+    
+    fsmInstruction[0] = REQUEST_POSITION;
+    fsmInstruction[1] = 0;
+    instructionList.push_back(fsmInstruction);
+}
+
+void CalculateIterativeMovement() {
+    if (!navTarget.isActive) {
+        MessageDebugf("DEBUG: -1, ID: %s, NavigationTarget no está activo", 
+                      robotID.c_str());
+        return;
+    }
+    
+    // Validación 1: Máximo de iteraciones
+    if (navTarget.HasExceededMaxIterations()) {
+        MessageDebugf("DEBUG: -1, ID: %s, ⚠️ Límite de iteraciones alcanzado (%d). Abortando navegación.", 
+                      robotID.c_str(), navTarget.maxIterations);
+        navTarget.Reset();
+        return;
+    }
+    
+    // Validación 2: Timeout total
+    if (navTarget.HasTimedOut()) {
+        MessageDebugf("DEBUG: -1, ID: %s, ⏱️ Timeout de navegación (>5min). Abortando.", 
+                      robotID.c_str());
+        navTarget.Reset();
+        return;
+    }
+    
+    navTarget.currentIteration++;
+    
+    float deltaX = navTarget.targetX - robotPose.x;
+    float deltaY = navTarget.targetY - robotPose.y;
+    float totalDistance = sqrt(deltaX * deltaX + deltaY * deltaY);
+    
+    MessageDebugf("DEBUG: -1, ID: %s, Iteración %d: pos=(%.1f,%.1f), target=(%.1f,%.1f), dist=%.1fmm", 
+                  robotID.c_str(), navTarget.currentIteration,
+                  robotPose.x, robotPose.y, 
+                  navTarget.targetX, navTarget.targetY, totalDistance);
+    
+    // Validación 3: Detección de loops
+    if (navTarget.IsInLoop(robotPose.x, robotPose.y)) {
+        MessageDebugf("DEBUG: -1, ID: %s, 🔄 LOOP DETECTADO. Abortando navegación.", 
+                      robotID.c_str());
+        navTarget.Reset();
+        return;
+    }
+    
+    // Validación 4: Progreso
+    if (!navTarget.IsMakingProgress(totalDistance)) {
+        MessageDebugf("DEBUG: -1, ID: %s, 📉 Sin progreso en %d iteraciones. Abortando.", 
+                      robotID.c_str(), navTarget.maxIterationsWithoutProgress);
+        navTarget.Reset();
+        return;
+    }
+    
+    // Registrar posición actual
+    navTarget.RecordPosition(robotPose.x, robotPose.y);
+    
+    // Verificar si llegamos
+    if (totalDistance < navTarget.arrivalThreshold) {
+        MessageDebugf("DEBUG: -1, ID: %s, ✅ Objetivo alcanzado. Distancia final: %.1fmm (iteraciones: %d)", 
+                      robotID.c_str(), totalDistance, navTarget.currentIteration);
+        navTarget.Reset();
+        return;
+    }
+    
     float targetAngle = atan2(deltaY, deltaX) * RAD_TO_DEG;
-    float angleDiff = targetAngle - robotPose.angle;
+    float angleDiff = NormalizeAngle(targetAngle - robotPose.angle);
     
-    while (angleDiff > 180) angleDiff -= 360;
-    while (angleDiff < -180) angleDiff += 360;
+    float segmentDistance;
     
+    if (totalDistance <= navTarget.segmentDistance) {
+        segmentDistance = totalDistance * 0.9;
+    } else {
+        segmentDistance = navTarget.segmentDistance;
+    }
+    
+    segmentDistance = constrain(segmentDistance, 
+                                navTarget.minSegmentDistance, 
+                                navTarget.maxSegmentDistance);
+    
+    MessageDebugf("DEBUG: -1, ID: %s, Segmento: dist=%.1fmm, ángulo=%.1f°, progreso=%d/%d", 
+                  robotID.c_str(), 
+                  segmentDistance, 
+                  angleDiff,
+                  navTarget.maxIterationsWithoutProgress - navTarget.iterationsWithoutProgress,
+                  navTarget.maxIterationsWithoutProgress);
+    
+    // Programar movimientos
     if (abs(angleDiff) > 5) {
         fsmInstruction[0] = TURN;
         fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
         instructionList.push_back(fsmInstruction);
     }
     
-    if (distance > 80) {
+    if (segmentDistance > navTarget.minSegmentDistance) {
         fsmInstruction[0] = MOVE;
-        fsmInstruction[1] = distance - 80;
+        fsmInstruction[1] = segmentDistance;
         instructionList.push_back(fsmInstruction);
     }
+    
+    fsmInstruction[0] = REQUEST_POSITION;
+    fsmInstruction[1] = 0;
+    instructionList.push_back(fsmInstruction);
+    
+    MessageDebugf("DEBUG: -1, ID: %s, Programando REQUEST_POSITION para siguiente iteración", 
+                  robotID.c_str());
 }
 
-/***************************************************************************************
 
- Función que inicializa el sensor frontal APDS-9960 y asegura que esté funcionando 
- correctamente antes de continuar. Si la inicialización falla, muestra un mensaje de 
- error en el puerto serial y utiliza un parpadeo en los LEDs del strip para indicar el 
- estado de fallo hasta que el sensor responda correctamente.
+// ============================================================================
+// FUNCIONES DE SENSORES Y HARDWARE
+// ============================================================================
 
-***************************************************************************************/
+
 void SetupFrontSensor() {
-  static bool sensorInitialized = false;
-  static unsigned long lastAttempt = 0;
-  
-  if (sensorInitialized) return;
+  if (frontSensorInitialized) return;
   
   unsigned long now = millis();
-  if (now - lastAttempt < 100) return;
+  if (now - lastFrontSensorAttempt < frontSensorRetryInterval) return;
   
-  lastAttempt = now;
+  lastFrontSensorAttempt = now;
+  
   if (frontSensor.begin()) {
-    sensorInitialized = true;
+    frontSensorInitialized = true;
     ledCtrl.setOff();
-    DebugSerialPrintln("Sensor APDS-9960 inicializado correctamente");
+    DebugSerialPrintln("✅ Sensor APDS-9960 inicializado correctamente");
   } else {
-    DebugSerialPrintln("Fallo la inicialización del sensor APDS-9960.");
-    ledCtrl.setBlink(255, 0, 0, maxBrightness, 250);
+    DebugSerialPrintln("⚠️ Falló la inicialización del sensor APDS-9960. Reintentando...");
+    ledCtrl.setBlink(255, 128, 0, maxBrightness, 500);
   }
 }
 
-/***************************************************************************************
-
- Función que verifica el estado de la conexión Wi-Fi y espera hasta que el robot esté 
- conectado a la red. Durante la conexión, se apagan los motores y se indica el estado 
- de conexión a través de un parpadeo en los LEDs del strip.
-
-***************************************************************************************/
 void WiFiStatus() {
   if (WiFi.status() != WL_CONNECTED) {
     static bool wifiConnecting = false;
     if (!wifiConnecting) {
       ConfigureHBridge(0, 0);
       DebugSerialPrintln("Conectando WiFi ...");
-      ledCtrl.setBlink(0, 255, 255, maxBrightness, 250); // Cian parpadeante
+      ledCtrl.setBlink(0, 255, 255, maxBrightness, 250);
       wifiConnecting = true;
     }
     return;
@@ -768,113 +1013,195 @@ void WiFiStatus() {
   }
 }
 
-/***************************************************************************************
+void ReadSensors() {
+  if (((millis() - movement.previousMillis) <= samplingTime - 2) || isLateralCycleActive || isCentralCycleActive || (debugUdp == 3)) {
+    currentMicros = micros();
+    if (currentMicros - previousMicros >= observationTime) {
+      previousMicros = currentMicros;
+      cycleCounter = (cycleCounter + 1) % numberOfCycles;
 
-Funcion selector del color del strip LED. 
+      isLateralCycleActive = (lateralCycle == cycleCounter);
 
-**************************************************************************************/
-void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
-  ledCtrl.setSolid(red, green, blue, maxBrightness);
-}
-
-/***************************************************************************************
-
-  Función para establecer el brillo del strip LED. 
-  
-  Esta función ajusta el brillo de los LEDs y actualiza la visualización.
-  
-  @param brightness El valor de brillo a establecer (0-255).
-
-**************************************************************************************/
-void setLedBrightness(uint8_t brightness) {
-  ledCtrl.brightness = brightness;
-  if (brightness == 0) ledCtrl.setOff();
-  else ledCtrl.currentState = LedController::SOLID;
-}
-
-void setLedBlink(uint8_t red, uint8_t green, uint8_t blue, unsigned long intervalMs = 250) {
-  ledCtrl.setBlink(red, green, blue, maxBrightness, intervalMs);
-}
-/***************************************************************************************
-
-  Función que lee los comandos enviados por el puerto serial y los procesa. 
-  Los comandos pueden ser "MOVE|valor", "TURN|valor" o "STOP". Dependiendo del comando, 
-  se actualiza la lista de instrucciones del robot y se envían mensajes de confirmación 
-  al puerto serial. Es solo de prueba y no se usa en el robot.
-
-***************************************************************************************/
-void ReadSerialCommands() {
-  if (Serial.available()) {
-    String command = Serial.readString();
-    command.trim();
-    
-    int separatorIndex = command.indexOf('|');
-    String cmd = command.substring(0, separatorIndex);
-    String valueStr = command.substring(separatorIndex + 1);
-    int value = valueStr.toInt();
-    
-    if (cmd == "MOVE") {
-      fsmInstruction[0] = MOVE;
-      fsmInstruction[1] = value;
-      instructionList.push_back(fsmInstruction);
-      Serial.printf("Comando MOVE %d mm agregado\n", value);
+      if (isLateralCycleActive != lateralSensorsEnabled) {
+        lateralSensorsEnabled = isLateralCycleActive;
+        digitalWrite(enableLeftInfraredSensor, lateralSensorsEnabled);
+        digitalWrite(enableRightInfraredSensor, lateralSensorsEnabled);
       
-    } else if (cmd == "TURN") {
-      fsmInstruction[0] = TURN;
-      fsmInstruction[1] = radians(value) * centerToWheelDistance;
-      instructionList.push_back(fsmInstruction);
-      Serial.printf("Comando TURN %d grados agregado\n", value);
-      
-    } else if (cmd == "STOP") {
-      instructionList.clear();
-      ConfigureHBridge(0, 0);
-      state = STOP;
-      Serial.println("Robot detenido");
-      
-    } else {
-      Serial.println("Comandos: MOVE|valor, TURN|valor, STOP");
+        // Resetear tiempos cuando se reactiva
+        if (lateralSensorsEnabled) {
+          leftObsStartTime = micros();
+          rightObsStartTime = micros();
+        }
+      }
+
+      isCentralCycleActive = (centralCycle == cycleCounter);
+      frontSensor.enableProximity(isCentralCycleActive);
     }
-  }
-}
 
+    if (isLateralCycleActive) {
+      obstacles.leftObstacle = (digitalRead(leftInfraredSensor) == LOW) && ((micros() - leftObsStartTime) >= minObstacleTime);
+      obstacles.rightObstacle = (digitalRead(rightInfraredSensor) == LOW) && ((micros() - rightObsStartTime) >= minObstacleTime);
+    }
 
-
-/*******************************************************************************************
-
- Función que envía un mensaje de prueba a cada robot registrado en la red (excepto 
- "Broadcast" y la "Base") para verificar la comunicación. Se limita a enviar un total de 500 
- mensajes durante la prueba. Una vez alcanzado el límite de mensajes, se indica el final de 
- la prueba al encender todos los LEDs del strip a su máximo brillo en color rojo durante 
- medio segundo.
-
-*******************************************************************************************/
-void CommunicationTest(){
-  if (sendMessages < 500) {
-    sendMessages ++;
-    for (const auto& pair : robots) {
-      if (pair.first != "Broadcast" && pair.first != "Base"){
-        SendMessage(pair.second, "COUNT_MESSAGE");
+    if (isCentralCycleActive) {
+      centralDistance = frontSensor.readProximity();
+      if (centralDistance > 2) {
+        obstacles.centralObstacle = (micros() - centralObsStartTime) >= minObstacleTime / 2;
+      } else {
+        centralObsStartTime = micros();
+        obstacles.centralObstacle = false;
       }
     }
+  }
+
+  if (debugUdp == 3) {
+    if (obstacles.HasAnyObstacle()) {
+      ledCtrl.setSolid(255, 128, 0, maxBrightness);
+    } else {
+      ledCtrl.setOff();
+    }
   } else {
-    ledCtrl.setSolid(255, 0, 0, 255); 
+    if ((digitalRead(batteryStatus) == LOW) && ((millis() - lowBatteryTime) >= minLowBatteryTime)) {
+      ledCtrl.setSolid(255, 255, 0, 255);
+    }
+  }
+
+  if (isEvading && (millis() - evasionStartTime > evasionCooldown)) {
+    isEvading = false;
+    MessageDebugf("DEBUG: -1, ID: %s, Cooldown de evasión completado", 
+                  robotID.c_str());
   }
 }
 
 
-/***************************************************************************************
+// ============================================================================
+// FUNCIONES DE CONTROL DE MOTORES
+// ============================================================================
 
- Función que separa un comando en substrings basados en un delimitador dado, y 
- almacena los resultados en un array de tamaño fijo de cinco elementos. Esta función 
- permite manejar hasta cinco partes de un comando. 
+void ResetPID() {
+  leftControl.Reset();
+  rightControl.Reset();
+  debugCounter = 0;
+  movement.Reset();
+}
 
- @param command   La cadena de texto que contiene el comando a separar.
- @param delimiter El carácter delimitador que indica dónde dividir la cadena.
- @return          Un array de cinco elementos que contiene las partes separadas de la 
-                  cadena; las posiciones restantes quedan vacías si el número de partes 
-                  es menor que cinco.
+void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
+  if (leftWheelPWM >= 0) {
+    ledcWrite(leftMotorBackward, 0);
+    ledcWrite(leftMotorForward, leftWheelPWM);
+  } else {
+    ledcWrite(leftMotorForward, 0);
+    ledcWrite(leftMotorBackward, abs(leftWheelPWM));
+  }
 
-***************************************************************************************/
+  if (rightWheelPWM >= 0) {
+    ledcWrite(rightMotorBackward, 0);
+    ledcWrite(rightMotorForward, rightWheelPWM);
+  } else {
+    ledcWrite(rightMotorForward, 0);
+    ledcWrite(rightMotorBackward, abs(rightWheelPWM));
+  }
+}
+
+float DesiredSpeed(float distance, float wheelDistance) {
+  float remainingDistance = distance - wheelDistance;
+  float desiredSpeed = maxSpeed;
+  if (abs(remainingDistance) < speedReductionThreshold) {
+    desiredSpeed = map(abs(remainingDistance), 0, speedReductionThreshold, minSpeed, maxSpeed);
+  }
+
+  return (remainingDistance < 0) ? -desiredSpeed : desiredSpeed;
+}
+
+bool IsStationary(float currentLeftSpeed, float currentRightSpeed, float leftWheelDistance, float rightWheelDistance) {
+  bool speedsAtZero = (static_cast<int>(abs(currentLeftSpeed) + abs(currentRightSpeed)) == 0);
+  bool wheelsHaveMoved = (static_cast<int>(abs(leftWheelDistance) + abs(rightWheelDistance)) != 0);
+  if (!speedsAtZero) {
+    movement.steadyStatePreviousMillis = millis();
+  } else if ((millis() - movement.steadyStatePreviousMillis >= SteadyStateTime) && wheelsHaveMoved) {
+    return true;
+  }
+
+  return false;
+}
+
+bool MoveDistanceByWheel(float leftDistance, float rightDistance) {
+  currentMillis = millis();
+  millisDifference = currentMillis - movement.previousMillis;
+  if (millisDifference < samplingTime) {
+    return false;
+  }
+
+  movement.previousMillis = currentMillis;
+
+  movement.currentLeftSpeed = ((movement.leftPulseCount - movement.pastLeftPulseCount) * millimetersPerPulse) / samplingTimeS;
+  movement.pastLeftPulseCount = movement.leftPulseCount;
+  movement.currentRightSpeed = ((movement.rightPulseCount - movement.pastRightPulseCount) * millimetersPerPulse) / samplingTimeS;
+  movement.pastRightPulseCount = movement.rightPulseCount;
+
+  float leftWheelDistance = movement.pastLeftPulseCount * millimetersPerPulse;
+  float desiredLeftSpeed = DesiredSpeed(leftDistance, leftWheelDistance);
+  int leftWheelPWM = leftControl.Calculate(desiredLeftSpeed, movement.currentLeftSpeed);
+
+  float rightWheelDistance = movement.pastRightPulseCount * millimetersPerPulse;
+  float desiredRightSpeed = DesiredSpeed(rightDistance, rightWheelDistance);
+  int rightWheelPWM = rightControl.Calculate(desiredRightSpeed, movement.currentRightSpeed);
+
+  ConfigureHBridge(leftWheelPWM, rightWheelPWM);
+  bool IsMoveFinished = ((abs(leftWheelDistance) + distanceOffset) >= abs(leftDistance)) &&
+                        ((abs(rightWheelDistance) + distanceOffset) >= abs(rightDistance));
+  IsMoveFinished = IsMoveFinished || IsStationary(movement.currentLeftSpeed, movement.currentRightSpeed, 
+                                                   leftWheelDistance, rightWheelDistance);
+  
+  if (debugUdp >= 2) {
+    MessageDebugf(debugMessage, debugCounter, robotID.c_str(), direction, 
+                  movement.leftPulseCount, movement.rightPulseCount, 
+                  movement.currentLeftSpeed, movement.currentRightSpeed, 
+                  leftWheelPWM, rightWheelPWM,
+                  leftControl.error, rightControl.error, 
+                  leftControl.sumError, rightControl.sumError, 
+                  leftWheelDistance, rightWheelDistance, millisDifference);
+  }
+
+  return IsMoveFinished;
+}
+
+
+// ============================================================================
+// FUNCIONES DE COMUNICACIÓN
+// ============================================================================
+
+void SendMessage(IPAddress host, const char* message) {
+  udp.beginPacket(host, localPort);
+  udp.write(reinterpret_cast<const uint8_t*>(message), strlen(message));
+  udp.endPacket();
+}
+
+void MessageDebugf(const char* format, ...) {
+  char buffer[200];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+
+  DebugSerialPrintln(buffer);
+  if (debugUdp != 0) {
+    SendMessage(robots["Base"], buffer);
+  }
+
+  debugCounter++;
+}
+
+void SendPose() {
+  obstacles.robotDetected = false;
+  const char* message = "CHECK_OBSTACLE|%d|%.1f|%.1f|%.1f";
+  char buffer[40];
+  snprintf(buffer, sizeof(buffer), message, obstacles.obstacleSensors, 
+           robotPose.x, robotPose.y, robotPose.angle);
+  SendMessage(robots["Broadcast"], buffer);
+  movement.previousMillis = millis();
+}
+
 std::array<String, 5> SeparateCommand(const String& command, char delimiter) {
   std::array<String, 5> results;
   int startIndex = 0;
@@ -896,65 +1223,33 @@ std::array<String, 5> SeparateCommand(const String& command, char delimiter) {
   return results;
 }
 
-/***************************************************************************************
-
- Función que envía un mensaje a una dirección IP específica mediante el protocolo UDP. 
- Utiliza el puerto definido localmente y asegura la conversión adecuada del mensaje para 
- el envío.
-
- @param host    La dirección IP del dispositivo receptor del mensaje.
- @param message El mensaje a enviar, en formato de cadena de caracteres.
-
-***************************************************************************************/
-void SendMessage(IPAddress host, const char* message) {
-  udp.beginPacket(host, localPort);
-  udp.write(reinterpret_cast<const uint8_t*>(message), strlen(message));
-  udp.endPacket();
-}
-
-
-/***************************************************************************************
-
- Función que determina si un obstáculo detectado es otro robot en función de su posición,
- orientación y sensores activados. Calcula la distancia y el ángulo entre el robot actual 
- y el posible obstáculo.
-
- @param x2       La posición en x del posible robot-obstáculo.
- @param y2       La posición en y del posible robot-obstáculo.
- @param angle    El ángulo del posible robot-obstáculo.
- @param sensors  Sensores activados del posible robot-obstáculo.
- @param id       Identificación del posible robot-obstáculo.
- 
- @return         Retorna `true` si el obstáculo es identificado como otro robot, `false`
-                 en caso contrario.
-
-***************************************************************************************/
 bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id) {
   float deltaX = x2 - robotPose.x;
   float deltaY = y2 - robotPose.y;
 
   float distanceBetweenRobots = sqrt(deltaX * deltaX + deltaY * deltaY);
   if (distanceBetweenRobots > robotDistanceMargin) {
-      return false;
+    return false;
   }
 
   float angleBetweenRobots = atan2f(deltaY, deltaX) * RAD_TO_DEG + 180;
   float angleDifference = angleBetweenRobots - angle;
 
-  // Ajustar para que la diferencia angular esté en el rango [-180, 180]
   if (angleDifference > 180) {
     angleDifference -= 360;
   } else if (angleDifference < -180) {
     angleDifference += 360;
   }
-  MessageDebugf("DEBUG: -1, ID: %s, From ID: %s, Distancia: %.1f, Angulo: %.1f, DifAngulo: %.1f, sensors: %d", robotID, id, distanceBetweenRobots, angleBetweenRobots, angleDifference, sensors);
+  
+  MessageDebugf("DEBUG: -1, ID: %s, From ID: %s, Distancia: %.1f, Angulo: %.1f, DifAngulo: %.1f, sensors: %d", 
+                robotID.c_str(), id.c_str(), distanceBetweenRobots, angleBetweenRobots, angleDifference, sensors);
 
-  if (_abs(angleDifference) <= maxRobotAngleMargin) {
+  if (abs(angleDifference) <= maxRobotAngleMargin) {
     if (sensors == 0b100 && angleDifference <= 0) {
       return true;
     } else if (sensors == 0b001 && angleDifference >= 0) {
       return true;
-    } else if (sensors != 0b100 && sensors != 0b001){
+    } else if (sensors != 0b100 && sensors != 0b001) {
       return true;
     }
   }
@@ -963,15 +1258,10 @@ bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id) {
 }
 
 
-/***************************************************************************************
+// ============================================================================
+// FUNCIÓN DE LECTURA DE PAQUETES UDP (REFACTORIZADA)
+// ============================================================================
 
- Función que lee los paquetes UDP recibidos y ejecuta diferentes comandos según el 
- contenido del mensaje. Permite configurar la red y los robots, mover el robot, ajustar 
- constantes de PID y filtros de Kalman, verificar la posición del robot, y detectar 
- obstáculos en el entorno. Cada comando se procesa y se actúa en consecuencia, 
- manteniendo la comunicación en tiempo real con otros robots o con la base.
-
-***************************************************************************************/
 void ReadUdpPackets() {
   int packetBytes = udp.parsePacket();
   if (!packetBytes) {
@@ -982,12 +1272,14 @@ void ReadUdpPackets() {
   if (len > 0) {
     receivedPacket[len] = 0;
   }
-  DebugSerialPrintf("Recibidos %d bytes de %s: %s\n", packetBytes, udp.remoteIP().toString().c_str(), receivedPacket);
+  DebugSerialPrintf("Recibidos %d bytes de %s: %s\n", packetBytes, 
+                    udp.remoteIP().toString().c_str(), receivedPacket);
 
   String command(receivedPacket);
   std::array<String, 5> arguments = SeparateCommand(command, '|');
   command = arguments[0];
 
+  // CONFIG
   if (command == "CONFIG") {
     if (arguments[1] == "START") {
       robots["Base"] = udp.remoteIP();
@@ -1004,7 +1296,7 @@ void ReadUdpPackets() {
 
     } else if (arguments[1] == "ROBOTS") {
       for (const auto& pair : robots) {
-        DebugSerialPrintf("Nombre: %s, IP: %s\n", pair.first, pair.second.toString().c_str());
+        DebugSerialPrintf("Nombre: %s, IP: %s\n", pair.first.c_str(), pair.second.toString().c_str());
       }
 
     } else if (arguments[1] == "DEBUG") {
@@ -1017,8 +1309,11 @@ void ReadUdpPackets() {
       snprintf(buffer, sizeof(buffer), "CONFIG|SAVE|%s", robotID.c_str());
       SendMessage(robots["Broadcast"], buffer);
     }
-
-  } else if (command == "MOVE" || command == "TURN" || command == "WAIT" || command == "RANDOMW" || command == "MESSAGE_BASE") {
+  }
+  
+  // INSTRUCCIONES DE MOVIMIENTO
+  else if (command == "MOVE" || command == "TURN" || command == "WAIT" || 
+           command == "RANDOMW" || command == "MESSAGE_BASE") {
     short value = arguments[1].toInt();
 
     if (command == "MOVE") {
@@ -1038,16 +1333,22 @@ void ReadUdpPackets() {
       fsmInstruction[1] = arguments[1].toInt();
     }
     instructionList.push_back(fsmInstruction);
-
-  } else if (command == "RESET") {
+  }
+  
+  // RESET
+  else if (command == "RESET") {
     ESP.restart();
-
-  } else if (command == "SERVO") {
+  }
+  
+  // SERVO
+  else if (command == "SERVO") {
     int servoAngle = constrain(arguments[1].toInt(), 5, 175);
     DebugSerialPrintf("Servo: %d°\n", servoAngle);
     frontServo.write(servoAngle);
-    
-  } else if (command == "PID") {
+  }
+  
+  // PID
+  else if (command == "PID") {
     float kp = arguments[1].toFloat();
     float ki = arguments[2].toFloat();
     float kd = arguments[3].toFloat();
@@ -1059,8 +1360,10 @@ void ReadUdpPackets() {
     rightControl.pidConst.ki = ki;
     rightControl.pidConst.kd = kd;
     SendMessage(robots["Base"], "PID velocidad modificado");
-
-  } else if (command == "KFPID") {
+  }
+  
+  // KFPID
+  else if (command == "KFPID") {
     float R = arguments[1].toFloat();
     float H = arguments[2].toFloat();
     float Q = arguments[3].toFloat();
@@ -1072,23 +1375,56 @@ void ReadUdpPackets() {
     rightControl.kf.H = H;
     rightControl.kf.Q = Q;
     SendMessage(robots["Base"], "Filtro de kalman modificado");
-
-  } else if (command == "POSE") {
+  }
+  
+  // POSE
+  else if (command == "POSE") {
     robotPose.x = arguments[1].toFloat();
     robotPose.y = arguments[2].toFloat();
     robotPose.angle = arguments[3].toFloat();
-
-  } else if (command == "SETPPR") {
+  }
+  
+  // SETPPR
+  else if (command == "SETPPR") {
     float newPPR = arguments[1].toFloat();
+    bool permanent = (arguments[2] == "SAVE");
+    
     if (newPPR > 100 && newPPR < 5000) {
       pulsesPerRev = newPPR;
       updateMillimetersPerPulse();
-      SendMessage(robots["Base"], "Pulsos por revolucion modificado");
+      
+      char buffer[100];
+      if (permanent) {
+        SavePPR(newPPR);
+        snprintf(buffer, sizeof(buffer), 
+                "PPR modificado y GUARDADO: %.2f (Robot ID: %s)", 
+                newPPR, robotID.c_str());
+      } else {
+        snprintf(buffer, sizeof(buffer), 
+                "PPR modificado temporalmente: %.2f (Robot ID: %s)", 
+                newPPR, robotID.c_str());
+      }
+      SendMessage(robots["Base"], buffer);
+      
     } else {
       SendMessage(robots["Base"], "Error: PPR debe estar entre 100-5000");
     }
-    
-  } else if (command == "CHECK_OBSTACLE") {
+  }
+  
+  // GETPPR
+  else if (command == "GETPPR") {
+    char buffer[100];
+    snprintf(buffer, sizeof(buffer), 
+            "Robot %s - PPR actual: %.2f, Chip ID: %04X%08X", 
+            robotID.c_str(), 
+            pulsesPerRev,
+            (uint16_t)(ESP.getEfuseMac()>>32),
+            (uint32_t)ESP.getEfuseMac());
+    SendMessage(robots["Base"], buffer);
+  }
+  
+  // CHECK_OBSTACLE
+  else if (command == "CHECK_OBSTACLE") {
     int sensors = arguments[1].toInt();
     float x = arguments[2].toFloat();
     float y = arguments[3].toFloat();
@@ -1104,33 +1440,45 @@ void ReadUdpPackets() {
 
     if (IsRobotObstacle(x, y, angle, sensors, id)) {
       char buffer[50];
-      snprintf(buffer, sizeof(buffer), "OBSTACLE_DETECTED|%s", robotID);
+      snprintf(buffer, sizeof(buffer), "OBSTACLE_DETECTED|%s", robotID.c_str());
       delayMicroseconds(800);
       SendMessage(robots[id], buffer);
       SendMessage(robots[id], buffer);
     }
-
-  } else if (command == "OBSTACLE_DETECTED") {
-    fromRobotID = arguments[1];
-    robotDetected = true;
-
-  } else if (command == "COUNT_MESSAGE") {
-    countMessages ++;
-
-  } else if (command == "SEND_COUNT_MESSAGE") {
+  }
+  
+  // OBSTACLE_DETECTED
+  else if (command == "OBSTACLE_DETECTED") {
+    obstacles.fromRobotID = arguments[1];
+    obstacles.robotDetected = true;
+  }
+  
+  // COUNT_MESSAGE
+  else if (command == "COUNT_MESSAGE") {
+    countMessages++;
+  }
+  
+  // SEND_COUNT_MESSAGE
+  else if (command == "SEND_COUNT_MESSAGE") {
     char buffer[50];
-    snprintf(buffer, sizeof(buffer), "Robot ID: %s, Total messages: %d", robotID, countMessages);
+    snprintf(buffer, sizeof(buffer), "Robot ID: %s, Total messages: %d", 
+             robotID.c_str(), countMessages);
     SendMessage(robots["Base"], buffer);
+  }
+  
+  // CONGREGATION
+  else if (command == "CONGREGATION") {
+    congregation.leaderID = arguments[1];
+    congregation.isLeader = (congregation.leaderID == robotID);
+    congregation.positionReceived = false;
+    congregation.hasGlobalTarget = false;
 
-  } else if (command == "CONGREGATION") {
-    leaderID = arguments[1];
-    isLeader = (leaderID == robotID);
-    positionReceived = false;
-    hasGlobalTarget = false;
+    navTarget.Reset();
 
-    MessageDebugf("DEBUG: -1, ID: %s, Congregacion iniciada. Lider: %s", robotID, leaderID.c_str());
+    MessageDebugf("DEBUG: -1, ID: %s, Congregación iniciada. Líder: %s", 
+                  robotID.c_str(), congregation.leaderID.c_str());
 
-    int delay = robotID.toInt() * 200; // Retraso basado en ID para evitar colisiones
+    int delay = robotID.toInt() * 200;
     fsmInstruction[0] = WAIT;
     fsmInstruction[1] = delay;
     instructionList.push_back(fsmInstruction);
@@ -1138,335 +1486,172 @@ void ReadUdpPackets() {
     fsmInstruction[0] = REQUEST_POSITION;
     fsmInstruction[1] = 0;
     instructionList.push_back(fsmInstruction);
-
-  } else if (command == "POSITIONGT") {
-    
+  }
+  
+  // POSITIONGT
+  else if (command == "POSITIONGT") {
     float targetX = arguments[1].toFloat();
     float targetY = arguments[2].toFloat();
     
-    globalTargetX = targetX;
-    globalTargetY = targetY;
-    hasGlobalTarget = true;  
-    positionReceived = false;
-
-    MessageDebugf("DEBUG: -1, ID: %s, Objetivo global establecido: x=%.1f, y=%.1f", 
-                  robotID.c_str(), globalTargetX, globalTargetY);
-
-    fsmInstruction[0] = REQUEST_POSITION;
-    fsmInstruction[1] = 0;
-    instructionList.push_back(fsmInstruction);
-
-  } else if (command == "POSITION_RESPONSE") {
+    if (arguments[3] != "") {
+      float customSegmentDist = arguments[3].toFloat();
+      if (customSegmentDist >= 50 && customSegmentDist <= 400) {
+        navTarget.segmentDistance = customSegmentDist;
+      }
+    }
     
+    MessageDebugf("DEBUG: -1, ID: %s, Objetivo global recibido: x=%.1f, y=%.1f, segDist=%.1fmm", 
+                  robotID.c_str(), targetX, targetY, navTarget.segmentDistance);
+    
+    InitiateIterativeNavigation(targetX, targetY);
+  }
+  
+  // POSITION_RESPONSE
+  else if (command == "POSITION_RESPONSE") {
     robotPose.x = arguments[1].toFloat();
     robotPose.y = arguments[2].toFloat();
     robotPose.angle = arguments[3].toFloat();
-    positionReceived = true;
 
-    MessageDebugf("DEBUG: -1, ID: %s, Posicion recibida: x=%.1f, y=%.1f, angulo=%.1f", 
+    MessageDebugf("DEBUG: -1, ID: %s, Posición recibida: x=%.1f, y=%.1f, ángulo=%.1f", 
                   robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
 
-    if (isLeader && leaderID != "-1") {
+    if (congregation.isLeader && congregation.leaderID != "-1") {
       char buffer[64];
-      snprintf(buffer, sizeof(buffer), "LEADER_POSITION|%s|%.1f|%.1f", 
-                robotID.c_str(), robotPose.x, robotPose.y);
+      snprintf(buffer, sizeof(buffer), "LEADER_POSITION|%s|%.1f|%.1f|%.1f", 
+              robotID.c_str(), robotPose.x, robotPose.y, robotPose.angle);
       
       if (robots.find("Broadcast") != robots.end()) {
-          SendMessage(robots["Broadcast"], buffer);
-          delayMicroseconds(500);
-          SendMessage(robots["Broadcast"], buffer);  
-          MessageDebugf("DEBUG: -1, ID: %s, Broadcasting posicion de lider", 
-                        robotID.c_str());
+        SendMessage(robots["Broadcast"], buffer);
+        delayMicroseconds(500);
+        SendMessage(robots["Broadcast"], buffer);
       }
     }
     
-    if (hasGlobalTarget) {
-        CalculateAndQueueMovement(globalTargetX, globalTargetY);
-        hasGlobalTarget = false;
-        globalTargetX = 0;
-        globalTargetY = 0;
+    if (navTarget.isActive) {
+      CalculateIterativeMovement();
     }
-  } else if (command == "LEADER_POSITION") {
+    else if (congregation.hasGlobalTarget) {
+      InitiateIterativeNavigation(congregation.globalTargetX, congregation.globalTargetY);
+      congregation.hasGlobalTarget = false;
+      congregation.globalTargetX = 0;
+      congregation.globalTargetY = 0;
+    }
+    
+    congregation.positionReceived = true;
+  }
+  
+  // LEADER_POSITION
+  else if (command == "LEADER_POSITION") {
     String receivedLeaderID = arguments[1];
 
-    if (!isLeader && receivedLeaderID == leaderID) {
-        float leaderX = arguments[2].toFloat();
-        float leaderY = arguments[3].toFloat();
-        
-        if (positionReceived) {
-            MessageDebugf("DEBUG: -1, ID: %s, Procesando posicion del lider", robotID.c_str());
-            CalculateAndQueueMovement(leaderX, leaderY);
-        } else {
-            globalTargetX = leaderX;
-            globalTargetY = leaderY;
-            hasGlobalTarget = true;
-            MessageDebugf("DEBUG: -1, ID: %s, Guardando posicion del lider para despues", robotID.c_str());
-        }
+    if (!congregation.isLeader && receivedLeaderID == congregation.leaderID) {
+      float leaderX = arguments[2].toFloat();
+      float leaderY = arguments[3].toFloat();
+      
+      if (congregation.positionReceived) {
+        MessageDebugf("DEBUG: -1, ID: %s, Procesando posición del líder", 
+                      robotID.c_str());
+        InitiateIterativeNavigation(leaderX, leaderY);
+      } else {
+        congregation.globalTargetX = leaderX;
+        congregation.globalTargetY = leaderY;
+        congregation.hasGlobalTarget = true;
+        MessageDebugf("DEBUG: -1, ID: %s, Guardando posición del líder para después", 
+                      robotID.c_str());
+      }
     }
-  } else if (command == "CANCEL_CONGREGATION") {
-    leaderID = "-1";
-    isLeader = false;
-    positionReceived = false;
-    hasGlobalTarget = false;
+  }
+  
+  // CANCEL_CONGREGATION
+  else if (command == "CANCEL_CONGREGATION") {
+    congregation.Reset();
+    navTarget.Reset();
     instructionList.clear();
     state = STOP;
-    MessageDebugf("DEBUG: -1, ID: %s, Congregacion cancelada", robotID.c_str());
+    MessageDebugf("DEBUG: -1, ID: %s, Congregación cancelada", robotID.c_str());
   }
-} 
-
-/***************************************************************************************
-
- Función que lee el estado de los sensores de proximidad y la batería. En cada ciclo, 
- activa los sensores infrarrojos laterales y el sensor frontal de proximidad de acuerdo 
- con el ciclo de lectura configurado. Verifica la presencia de obstáculos en los tres 
- sensores y ajusta el estado de los LEDs para indicar si hay una detección de obstáculos 
- o batería baja.
-
-***************************************************************************************/
-void ReadSensors() {
-  if (((millis() - previousMillis) <= samplingTime - 2) || isLateralCycleActive || isCentralCycleActive || (debugUdp == 3)) {
-    currentMicros = micros();
-    if (currentMicros - previousMicros >= observationTime) {
-      previousMicros = currentMicros;
-      cycleCounter = (cycleCounter + 1) % numberOfCycles;
-
-      isLateralCycleActive = (lateralCycle == cycleCounter);
-      digitalWrite(enableLeftInfraredSensor, isLateralCycleActive);
-      digitalWrite(enableRightInfraredSensor, isLateralCycleActive);
-
-      isCentralCycleActive = (centralCycle == cycleCounter);
-      frontSensor.enableProximity(isCentralCycleActive);
-    }
-
-    if (isLateralCycleActive) {     
-      leftObstacle = (digitalRead(leftInfraredSensor) == LOW) && ((micros() - leftObsStartTime) >= minObstacleTime);
-      rightObstacle = (digitalRead(rightInfraredSensor) == LOW) && ((micros() - rightObsStartTime) >= minObstacleTime);
-    }
-
-    if (isCentralCycleActive) {
-      centralDistance = frontSensor.readProximity();
-      if (centralDistance > 2) {
-        centralObstacle = (micros() - centralObsStartTime) >= minObstacleTime / 2;
-      } else {
-        centralObsStartTime = micros();
-        centralObstacle = false;
+  
+  // CLEAR_EVASION
+  else if (command == "CLEAR_EVASION") {
+    intContext.Clear();
+    isEvading = false;
+    resumeScheduled = false;
+    obstacles.Clear();
+    instructionList.clear();
+    state = STOP;
+    MessageDebugf("DEBUG: -1, ID: %s, Sistema de evasión reseteado", 
+                  robotID.c_str());
+  }
+  
+  // NAV_CONFIG
+  else if (command == "NAV_CONFIG") {
+    if (arguments[1] == "SEGMENT_DIST") {
+      float newDist = arguments[2].toFloat();
+      if (newDist >= 50 && newDist <= 400) {
+        navTarget.segmentDistance = newDist;
+        MessageDebugf("DEBUG: -1, ID: %s, Distancia de segmento: %.1fmm", 
+                      robotID.c_str(), newDist);
+      }
+    } else if (arguments[1] == "ARRIVAL_THRESHOLD") {
+      float newThreshold = arguments[2].toFloat();
+      if (newThreshold >= 30 && newThreshold <= 150) {
+        navTarget.arrivalThreshold = newThreshold;
+        MessageDebugf("DEBUG: -1, ID: %s, Umbral de llegada: %.1fmm", 
+                      robotID.c_str(), newThreshold);
+      }
+    } else if (arguments[1] == "MAX_ITER") {
+      int newMax = arguments[2].toInt();
+      if (newMax >= 10 && newMax <= 100) {
+        navTarget.maxIterations = newMax;
+        MessageDebugf("DEBUG: -1, ID: %s, Máximo de iteraciones: %d", 
+                      robotID.c_str(), newMax);
       }
     }
   }
 
-  if (debugUdp == 3) {
-    if (leftObstacle || centralObstacle || rightObstacle) {
-      ledCtrl.setSolid(255, 128, 0, maxBrightness); // Naranja
-    } else {
-      ledCtrl.setOff();
-    }
-  } else {
-    if ((digitalRead(batteryStatus) == LOW) && ((millis() - lowBatteryTime) >= minLowBatteryTime)) {
-      ledCtrl.setSolid(255, 255, 0, 255); // Amarillo
-    }
-  }
-}
-
-
-/***************************************************************************************
-
- Función que reinicia los controladores PID y las variables de conteo de pulsos para 
- ambos motores. Se utiliza para restablecer el estado de los controladores y las 
- métricas relacionadas al control de movimiento antes de iniciar un nuevo ciclo.
-
-***************************************************************************************/
-void ResetPID() {
-  leftControl.Reset();
-  rightControl.Reset();
-  debugCounter = 0;
-  leftPulseCount = 0;
-  rightPulseCount = 0;
-  pastLeftPulseCount = 0;
-  pastRightPulseCount = 0;
-}
-
-
-/***************************************************************************************
-
- Configura el puente H para controlar la dirección y velocidad de los motores de las ruedas.
- Ajusta los pines de PWM para los motores izquierdo y derecho según el valor del PWM 
- proporcionado. Si el valor de PWM es positivo, el motor gira hacia adelante; si es 
- negativo, hacia atrás.
-
- @param leftWheelPWM Valor de PWM para el motor de la rueda izquierda.
- @param rightWheelPWM Valor de PWM para el motor de la rueda derecha.
-
-***************************************************************************************/
-void ConfigureHBridge(int leftWheelPWM, int rightWheelPWM) {
-  if (leftWheelPWM >= 0) {
-    ledcWrite(leftMotorBackward, 0);
-    ledcWrite(leftMotorForward, leftWheelPWM);
-  } else {
-    ledcWrite(leftMotorForward, 0);
-    ledcWrite(leftMotorBackward, _abs(leftWheelPWM));
-  }
-
-  if (rightWheelPWM >= 0) {
-    ledcWrite(rightMotorBackward, 0);
-    ledcWrite(rightMotorForward, rightWheelPWM);
-  } else {
-    ledcWrite(rightMotorForward, 0);
-    ledcWrite(rightMotorBackward, _abs(rightWheelPWM));
-  }
-}
-
-
-/***************************************************************************************
-
- Calcula la velocidad deseada en función de la distancia restante.
- Si la distancia restante es menor que el umbral de reducción de velocidad, ajusta la 
- velocidad deseada utilizando un mapeo lineal entre la velocidad mínima y máxima.
-
- @param distance Distancia total que se desea recorrer.
- @param wheelDistance Distancia que ya se ha recorrido por las ruedas.
-
- @return Velocidad deseada, que puede ser positiva o negativa según la distancia restante.
-
-***************************************************************************************/
-float DesiredSpeed(float distance, float wheelDistance) {
-  float remainingDistance = distance - wheelDistance;
-  float desiredSpeed = maxSpeed;
-  if (_abs(remainingDistance) < speedReductionThreshold) {
-    desiredSpeed = map(_abs(remainingDistance), 0, speedReductionThreshold, minSpeed, maxSpeed);
-  }
-
-  return (remainingDistance < 0) ? -desiredSpeed : desiredSpeed;
-}
-
-
-/***************************************************************************************
-
- Determina si el robot está en estado estacionario basado en la velocidad actual de las ruedas
- y la distancia recorrida. Si la velocidad de ambas ruedas es cero y han recorrido una 
- distancia significativa en un tiempo dado, se considera que el robot está estacionario.
-
- @param currentLeftSpeed Velocidad actual de la rueda izquierda.
- @param currentRightSpeed Velocidad actual de la rueda derecha.
- @param leftWheelDistance Distancia recorrida por la rueda izquierda.
- @param rightWheelDistance Distancia recorrida por la rueda derecha.
-
- @return true si el robot está en estado estacionario, false en caso contrario.
-
-***************************************************************************************/
-bool IsStationary(float currentLeftSpeed, float currentRightSpeed, float leftWheelDistance, float rightWheelDistance) {
-  bool speedsAtZero = (static_cast<int>(_abs(currentLeftSpeed) + _abs(currentRightSpeed)) == 0);
-  bool wheelsHaveMoved = (static_cast<int>(_abs(leftWheelDistance) + _abs(rightWheelDistance)) != 0);
-  if (!speedsAtZero) {
-    SteadyStatePreviousMillis = millis();
-  } else if ((millis() - SteadyStatePreviousMillis >= SteadyStateTime) && wheelsHaveMoved) {
-    return true;
-  }
-
-  return false;
-}
-
-
-/***************************************************************************************
-
- Envía un mensaje de depuración formateado a la consola y si el modo de depuración 
- está activado, también lo envía a la base. La función permite el uso de 
- especificadores de formato similares a printf.
-
- @param format Formato del mensaje a imprimir, similar a printf.
- @param ... Parámetros adicionales que se utilizarán en el formato.
-
-***************************************************************************************/
-void MessageDebugf(const char* format, ...) {
-  char buffer[200];
-  va_list args;
-  va_start(args, format);
-  vsnprintf(buffer, sizeof(buffer), format, args);
-  va_end(args);
-
-  DebugSerialPrintln(buffer);
-  if (debugUdp != 0) {
+  //GET_STATUS
+  else if (command == "GET_STATUS") {
+    char buffer[200];
+    snprintf(buffer, sizeof(buffer), 
+            "STATUS|ID:%s|State:%d|NavActive:%d|Evading:%d|Obstacles:%d|Sensors:L%d-C%d-R%d|Pos:(%.1f,%.1f,%.1f)|Target:(%.1f,%.1f)|Iter:%d/%d",
+            robotID.c_str(),
+            state,
+            navTarget.isActive,
+            isEvading,
+            obstacles.HasAnyObstacle(),
+            obstacles.leftObstacle,
+            obstacles.centralObstacle,
+            obstacles.rightObstacle,
+            robotPose.x, robotPose.y, robotPose.angle,
+            navTarget.targetX, navTarget.targetY,
+            navTarget.currentIteration, navTarget.maxIterations);
     SendMessage(robots["Base"], buffer);
   }
 
-  debugCounter++;
-}
-
-
-/***************************************************************************************
-
- Controla el movimiento del robot para que recorra una distancia específica con cada 
- rueda. Calcula la velocidad actual de las ruedas basándose en la cantidad de pulsos 
- de cada rueda desde la última llamada. Luego, determina la velocidad deseada y 
- ajusta el PWM para controlar el puente H. La función retorna verdadero si se ha 
- alcanzado la distancia deseada o si el robot está estacionario.
-
- @param leftDistance Distancia que la rueda izquierda debe recorrer en milímetros.
- @param rightDistance Distancia que la rueda derecha debe recorrer en milímetros.
-
- @return true si el movimiento ha terminado, false en caso contrario.
-
-***************************************************************************************/
-bool MoveDistanceByWheel(float leftDistance, float rightDistance) {
-  currentMillis = millis();
-  millisDifference = currentMillis - previousMillis;
-  if (millisDifference < samplingTime) {
-    return false;
+  else if (command == "RESET_EVASION") {
+    evasionTracker.Reset();
+    intContext.Clear();
+    isEvading = false;
+    resumeScheduled = false;
+    obstacles.Clear();
+    MessageDebugf("DEBUG: -1, ID: %s, ✅ Sistema de evasión reseteado manualmente", 
+                  robotID.c_str());
   }
 
-  previousMillis = currentMillis;
-
-  // Se calculan las velocidades de ambas ruedas
-  currentLeftSpeed = ((leftPulseCount - pastLeftPulseCount) * millimetersPerPulse) / samplingTimeS;  // velocidad en mm/s
-  pastLeftPulseCount = leftPulseCount;
-  currentRightSpeed = ((rightPulseCount - pastRightPulseCount) * millimetersPerPulse) / samplingTimeS;  // velocidad en mm/s
-  pastRightPulseCount = rightPulseCount;
-
-  float leftWheelDistance = pastLeftPulseCount * millimetersPerPulse;
-  float desiredLeftSpeed = DesiredSpeed(leftDistance, leftWheelDistance);
-  int leftWheelPWM = leftControl.Calculate(desiredLeftSpeed, currentLeftSpeed);
-
-  float rightWheelDistance = pastRightPulseCount * millimetersPerPulse;
-  float desiredRightSpeed = DesiredSpeed(rightDistance, rightWheelDistance);
-  int rightWheelPWM = rightControl.Calculate(desiredRightSpeed, currentRightSpeed);
-
-  ConfigureHBridge(leftWheelPWM, rightWheelPWM);
-  bool IsMoveFinished = ((_abs(leftWheelDistance) + distanceOffset) >= _abs(leftDistance)) &&
-                     ((_abs(rightWheelDistance) + distanceOffset) >= _abs(rightDistance));
-  IsMoveFinished = IsMoveFinished || IsStationary(currentLeftSpeed, currentRightSpeed, leftWheelDistance, rightWheelDistance);
-  
-  if (debugUdp >= 2){
-    MessageDebugf(debugMessage, debugCounter, robotID, direction, leftPulseCount, rightPulseCount, currentLeftSpeed, currentRightSpeed, leftWheelPWM, rightWheelPWM,
-                  leftControl.error, rightControl.error, leftControl.sumError, rightControl.sumError, leftWheelDistance, rightWheelDistance, millisDifference);
+  else if (command == "ABORT_NAV") {
+    navTarget.Reset();
+    instructionList.clear();
+    state = STOP;
+    MessageDebugf("DEBUG: -1, ID: %s, ✅ Navegación abortada manualmente", 
+                  robotID.c_str());
   }
-
-  return IsMoveFinished;
 }
 
 
-/***************************************************************************************
+// ============================================================================
+// FUNCIONES AUXILIARES
+// ============================================================================
 
- Envía la posición actual del robot junto con el estado de los sensores de obstáculos 
- a otros robots en la red.
-
-***************************************************************************************/
-void SendPose() {
-  robotDetected = false;
-  const char* message = "CHECK_OBSTACLE|%d|%.1f|%.1f|%.1f";
-  char buffer[40];
-  snprintf(buffer, sizeof(buffer), message, obstacleSensors, robotPose.x, robotPose.y, robotPose.angle);
-  SendMessage(robots["Broadcast"], buffer);
-  previousMillis = millis();
-}
-
-
-/***************************************************************************************
-
- Selecciona aleatoriamente el siguiente movimiento que el robot realizará, considerando
- si hay obstáculos detectados. El robot puede girar a la derecha, avanzar hacia adelante
- o girar a la izquierda. La selección se basa en probabilidades predefinidas y se 
- almacena la instrucción correspondiente en una deque.
-
-***************************************************************************************/
 void SelectMovementRW() {
   int probabilityTurnPos = 15;
   int probabilityMove = 70 * (obstacleDetected ? 0 : 1);
@@ -1510,11 +1695,119 @@ void SelectMovementRW() {
   instructionList.push_front(fsmInstruction);
 }
 
+void CommunicationTest() {
+  if (sendMessages < 500) {
+    sendMessages++;
+    for (const auto& pair : robots) {
+      if (pair.first != "Broadcast" && pair.first != "Base") {
+        SendMessage(pair.second, "COUNT_MESSAGE");
+      }
+    }
+  } else {
+    ledCtrl.setSolid(255, 0, 0, 255);
+  }
+}
+
+#ifdef DebugSerial
+void ReadSerialCommands() {
+  if (Serial.available()) {
+    String command = Serial.readString();
+    command.trim();
+    
+    int separatorIndex = command.indexOf('|');
+    String cmd = command.substring(0, separatorIndex);
+    String valueStr = command.substring(separatorIndex + 1);
+    int value = valueStr.toInt();
+    
+    if (cmd == "MOVE") {
+      fsmInstruction[0] = MOVE;
+      fsmInstruction[1] = value;
+      instructionList.push_back(fsmInstruction);
+      Serial.printf("Comando MOVE %d mm agregado\n", value);
+      
+    } else if (cmd == "TURN") {
+      fsmInstruction[0] = TURN;
+      fsmInstruction[1] = radians(value) * centerToWheelDistance;
+      instructionList.push_back(fsmInstruction);
+      Serial.printf("Comando TURN %d grados agregado\n", value);
+      
+    } else if (cmd == "STOP") {
+      instructionList.clear();
+      ConfigureHBridge(0, 0);
+      state = STOP;
+      Serial.println("Robot detenido");
+      
+    } else {
+      Serial.println("Comandos: MOVE|valor, TURN|valor, STOP");
+    }
+  }
+}
+#endif
+
+
+// ============================================================================
+// FUNCIONES DE LED
+// ============================================================================
+
+void LedController::update() {
+  unsigned long now = millis();
+  switch (currentState) {
+    case OFF:
+      if (brightness != 0) {
+        brightness = 0;
+        FastLED.setBrightness(0);
+        FastLED.show();
+      }
+      break;
+      
+    case SOLID:
+      if (now - lastUpdate > 50) {
+        leds[0] = CRGB(red, green, blue);
+        FastLED.setBrightness(brightness);
+        FastLED.show();
+        lastUpdate = now;
+      }
+      break;
+      
+    case BLINKING:
+      if (now - lastUpdate >= interval) {
+        blinkState = !blinkState;
+        if (blinkState) {
+          leds[0] = CRGB(red, green, blue);
+          FastLED.setBrightness(brightness);
+        } else {
+          FastLED.setBrightness(0);
+        }
+        FastLED.show();
+        lastUpdate = now;
+      }
+      break;
+  }
+}
+
+void setLedColor(uint8_t red, uint8_t green, uint8_t blue) {
+  ledCtrl.setSolid(red, green, blue, maxBrightness);
+}
+
+void setLedBrightness(uint8_t brightness) {
+  ledCtrl.brightness = brightness;
+  if (brightness == 0) ledCtrl.setOff();
+  else ledCtrl.currentState = LedController::SOLID;
+}
+
+void setLedBlink(uint8_t red, uint8_t green, uint8_t blue, unsigned long intervalMs) {
+  ledCtrl.setBlink(red, green, blue, maxBrightness, intervalMs);
+}
+
+
+// ============================================================================
+// FUNCIONES IMU (OPCIONAL)
+// ============================================================================
+
 bool StoreValido(biasStore* store) {
   int32_t suma = store->header;
 
   if (suma != 0x42) return false;
-
 
   suma += store->biasGyroX;
   suma += store->biasGyroY;
@@ -1530,299 +1823,140 @@ bool StoreValido(biasStore* store) {
 }
 
 void setupIMU() {
-  // imu.enableDebugging();
-  bool success = false;
-  while (!success) {
+  DebugSerialPrintln("Inicializando IMU ICM-20948...");
+  
+  bool imuDetected = false;
+  int attempts = 0;
+  const int maxAttempts = 3;
+  
+  while (!imuDetected && attempts < maxAttempts) {
+    attempts++;
+    DebugSerialPrintf("Intento %d/%d de conexión con IMU...\n", attempts, maxAttempts);
+    
     imu.begin(Wire, AD0_VAL);
-    if (imu.status != ICM_20948_Stat_Ok) {
-      DebugSerialPrintln("Fallo inicializando la IMU, provando de nuevo...");
-      ledCtrl.setSolid(255, 0, 0, maxBrightness);
+    
+    if (imu.status == ICM_20948_Stat_Ok) {
+      imuDetected = true;
+      DebugSerialPrintln("IMU detectada correctamente");
     } else {
-      success = true;
+      DebugSerialPrintf("Error al conectar con IMU. Status: %d\n", imu.status);
+      delay(500);
     }
   }
-
+  
+  if (!imuDetected) {
+    DebugSerialPrintln("ERROR CRÍTICO: No se pudo detectar la IMU");
+    DebugSerialPrintln("Verifica:");
+    DebugSerialPrintln("  1. Conexión física del cable Qwiic");
+    DebugSerialPrintln("  2. AD0_VAL debe ser 1 (dirección 0x69) o 0 (dirección 0x68)");
+    DebugSerialPrintln("  3. Que no haya conflictos con otros dispositivos I2C");
+    
+    ledCtrl.setBlink(255, 0, 0, maxBrightness, 500);
+    return;
+  }
+  
+  DebugSerialPrintln("Inicializando DMP...");
+  bool success = true;
+  
   success &= (imu.initializeDMP() == ICM_20948_Stat_Ok);
+  if (!success) {
+    DebugSerialPrintln("ERROR: Falló initializeDMP()");
+    ledCtrl.setBlink(255, 128, 0, maxBrightness, 300);
+    return;
+  }
+  
   success &= (imu.enableDMPSensor(INV_ICM20948_SENSOR_ROTATION_VECTOR) == ICM_20948_Stat_Ok);
   success &= (imu.enableDMPSensor(INV_ICM20948_SENSOR_ACCELEROMETER) == ICM_20948_Stat_Ok);
-
-  // E.g. For a 225Hz ODR rate when DMP is running at 225Hz, value = (225/112.5) - 1 = 1.
+  
+  if (!success) {
+    DebugSerialPrintln("ERROR: Falló habilitando sensores DMP");
+    return;
+  }
+  
   success &= (imu.setDMPODRrate(DMP_ODR_Reg_Quat9, 1) == ICM_20948_Stat_Ok);
   success &= (imu.setDMPODRrate(DMP_ODR_Reg_Accel, 1) == ICM_20948_Stat_Ok);
-
+  
   success &= (imu.enableFIFO() == ICM_20948_Stat_Ok);
   success &= (imu.enableDMP() == ICM_20948_Stat_Ok);
   success &= (imu.resetDMP() == ICM_20948_Stat_Ok);
   success &= (imu.resetFIFO() == ICM_20948_Stat_Ok);
-
+  
   if (!success) {
-    DebugSerialPrintln("Fallo la inicializacion del DPM.");
-    DebugSerialPrintln("Verifique que la linea 29 (#define ICM_20948_USE_DMP) de ICM_20948_C.h este sin comentar.");
-    ledCtrl.setSolid(0, 255, 0, maxBrightness); // Verde sólido para error DMP
+    DebugSerialPrintln("ERROR: Falló configurando FIFO/DMP");
+    DebugSerialPrintln("Verifica que ICM_20948_USE_DMP esté definido en ICM_20948_C.h");
+    ledCtrl.setBlink(0, 255, 0, maxBrightness, 300);
+    return;
   }
-
+  
   if (!EEPROM.begin(128)) {
-    DebugSerialPrintln("Fallo la inicializacion de la EEPROM.");
-    ledCtrl.setSolid(255, 0, 0, maxBrightness); // Rojo sólido para error EEPROM
-  }
-
-  EEPROM.get(0, store);
-  if (StoreValido(&store)) {
-    success &= (imu.setBiasGyroX(store.biasGyroX) == ICM_20948_Stat_Ok);
-    success &= (imu.setBiasGyroY(store.biasGyroY) == ICM_20948_Stat_Ok);
-    success &= (imu.setBiasGyroZ(store.biasGyroZ) == ICM_20948_Stat_Ok);
-    success &= (imu.setBiasAccelX(store.biasAccelX) == ICM_20948_Stat_Ok);
-    success &= (imu.setBiasAccelY(store.biasAccelY) == ICM_20948_Stat_Ok);
-    success &= (imu.setBiasAccelZ(store.biasAccelZ) == ICM_20948_Stat_Ok);
-    success &= (imu.setBiasCPassX(store.biasCPassX) == ICM_20948_Stat_Ok);
-    success &= (imu.setBiasCPassY(store.biasCPassY) == ICM_20948_Stat_Ok);
-    success &= (imu.setBiasCPassZ(store.biasCPassZ) == ICM_20948_Stat_Ok);
-
-    if (!success) {
-      DebugSerialPrintln("No se pudo restaurar la calibracion de la IMU.");
-      //setLedBrightness(maxBrightness);
-      //setLedColor(0, 255, 0); // Verde
-    }
+    DebugSerialPrintln("ADVERTENCIA: Falló inicializando EEPROM");
   } else {
-    DebugSerialPrintln("No se encontro una calibracion valida para la IMU.");
-    //setLedBrightness(maxBrightness);
-    //setLedColor(255, 0, 0); // Rojo
+    EEPROM.get(0, store);
+    
+    if (StoreValido(&store)) {
+      DebugSerialPrintln("Calibración válida encontrada en EEPROM");
+      
+      success &= (imu.setBiasGyroX(store.biasGyroX) == ICM_20948_Stat_Ok);
+      success &= (imu.setBiasGyroY(store.biasGyroY) == ICM_20948_Stat_Ok);
+      success &= (imu.setBiasGyroZ(store.biasGyroZ) == ICM_20948_Stat_Ok);
+      success &= (imu.setBiasAccelX(store.biasAccelX) == ICM_20948_Stat_Ok);
+      success &= (imu.setBiasAccelY(store.biasAccelY) == ICM_20948_Stat_Ok);
+      success &= (imu.setBiasAccelZ(store.biasAccelZ) == ICM_20948_Stat_Ok);
+      success &= (imu.setBiasCPassX(store.biasCPassX) == ICM_20948_Stat_Ok);
+      success &= (imu.setBiasCPassY(store.biasCPassY) == ICM_20948_Stat_Ok);
+      success &= (imu.setBiasCPassZ(store.biasCPassZ) == ICM_20948_Stat_Ok);
+      
+      if (success) {
+        DebugSerialPrintln("Calibración restaurada correctamente");
+      } else {
+        DebugSerialPrintln("ADVERTENCIA: Falló al aplicar calibración");
+      }
+    } else {
+      DebugSerialPrintln("ADVERTENCIA: No hay calibración válida en EEPROM");
+      DebugSerialPrintln("La IMU funcionará con valores por defecto");
+    }
   }
+  
+  DebugSerialPrintln("IMU inicializada exitosamente");
+  ledCtrl.setSolid(0, 255, 0, maxBrightness);
+  delay(1000);
+  ledCtrl.setOff();
 }
 
 void LeerYaw() {
   icm_20948_DMP_data_t data;
   imu.readDMPdataFromFIFO(&data);
-  if (((imu.status == ICM_20948_Stat_Ok) || (imu.status == ICM_20948_Stat_FIFOMoreDataAvail)) && true) {
-    if ((data.header & DMP_header_bitmap_Quat9) > 0) {
-      double q1 = ((double)data.Quat9.Data.Q1) / 1073741824.0;
-      double q2 = ((double)data.Quat9.Data.Q2) / 1073741824.0;
-      double q3 = ((double)data.Quat9.Data.Q3) / 1073741824.0;
-      double q0 = sqrt(1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3)));
-
-      double t3 = +2.0 * (q0 * q3 + q1 * q2);
-      double t4 = +1.0 - 2.0 * (q2 * q2 + q3 * q3);
-      yaw = fmod(-atan2(t3, t4) * RAD_TO_DEG + 450.0, 360.0);
-    }
+  
+  if ((imu.status != ICM_20948_Stat_Ok) && 
+      (imu.status != ICM_20948_Stat_FIFOMoreDataAvail)) {
+    DebugSerialPrintf("Error leyendo FIFO: %d\n", imu.status);
+    return;
   }
-
+  
+  if ((data.header & DMP_header_bitmap_Quat9) == 0) {
+    DebugSerialPrintln("No hay datos de Quaternion disponibles");
+    return;
+  }
+  
+  double q1 = ((double)data.Quat9.Data.Q1) / 1073741824.0;
+  double q2 = ((double)data.Quat9.Data.Q2) / 1073741824.0;
+  double q3 = ((double)data.Quat9.Data.Q3) / 1073741824.0;
+  double q0 = sqrt(1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3)));
+  
+  double t3 = +2.0 * (q0 * q3 + q1 * q2);
+  double t4 = +1.0 - 2.0 * (q2 * q2 + q3 * q3);
+  yaw = fmod(-atan2(t3, t4) * RAD_TO_DEG + 450.0, 360.0);
+  
+  DebugSerialPrintf("Yaw actual: %.2f°\n", yaw);
+  
+  if ((data.header & DMP_header_bitmap_Accel) > 0) {
+    float accX = (float)data.Raw_Accel.Data.X / conversionFactor;
+    float accY = (float)data.Raw_Accel.Data.Y / conversionFactor;
+    float accZ = (float)data.Raw_Accel.Data.Z / conversionFactor;
+    
+    imuGravity = sqrt(accX * accX + accY * accY + accZ * accZ);
+    DebugSerialPrintf("Gravedad: %.2f mm/s² (esperado ~9806.65)\n", imuGravity);
+  }
+  
   imu.resetFIFO();
-}
-
-ICM_20948_Status_e ICM_20948::initializeDMP(void) {
-  ICM_20948_Status_e result = ICM_20948_Stat_Ok;
-  ICM_20948_Status_e worstResult = ICM_20948_Stat_Ok;
-  result = i2cControllerConfigurePeripheral(0, MAG_AK09916_I2C_ADDR, AK09916_REG_RSV2, 10, true, true, false, true, true);
-  if (result > worstResult) worstResult = result;
-  result = i2cControllerConfigurePeripheral(1, MAG_AK09916_I2C_ADDR, AK09916_REG_CNTL2, 1, false, true, false, false, false, AK09916_mode_single);
-  if (result > worstResult) worstResult = result;
-  result = setBank(3);
-  if (result > worstResult) worstResult = result;
-  uint8_t mstODRconfig = 0x04;
-  result = write(AGB3_REG_I2C_MST_ODR_CONFIG, &mstODRconfig, 1);
-  if (result > worstResult) worstResult = result;
-  result = setClockSource(ICM_20948_Clock_Auto);
-  if (result > worstResult) worstResult = result;
-  result = setBank(0);
-  if (result > worstResult) worstResult = result;
-  uint8_t pwrMgmt2 = 0x40;
-  result = write(AGB0_REG_PWR_MGMT_2, &pwrMgmt2, 1);
-  if (result > worstResult) worstResult = result;
-  result = setSampleMode(ICM_20948_Internal_Mst, ICM_20948_Sample_Mode_Cycled);
-  if (result > worstResult) worstResult = result;
-  result = enableFIFO(false);
-  if (result > worstResult) worstResult = result;
-  result = enableDMP(false);
-  if (result > worstResult) worstResult = result;
-
-  // Set Gyro FSR (Full scale range) to 2000dps through GYRO_CONFIG_1
-  // Set Accel FSR (Full scale range) to 4g through ACCEL_CONFIG
-  ICM_20948_fss_t myFSS;
-  myFSS.a = gpm4;     // (ICM_20948_ACCEL_CONFIG_FS_SEL_e)
-                      // gpm2
-                      // gpm4
-                      // gpm8
-                      // gpm16
-  myFSS.g = dps2000;  // (ICM_20948_GYRO_CONFIG_1_FS_SEL_e)
-                      // dps250
-                      // dps500
-                      // dps1000
-                      // dps2000
-  result = setFullScale((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), myFSS);
-  if (result > worstResult) worstResult = result;
-
-  // Set up Digital Low-Pass Filter configuration
-  ICM_20948_dlpcfg_t myDLPcfg;   // Similar to FSS, this uses a configuration structure for the desired sensors
-  myDLPcfg.a = acc_d5bw7_n8bw3;  // (ICM_20948_ACCEL_CONFIG_DLPCFG_e)
-                                 // acc_d246bw_n265bw      - means 3db bandwidth is 246 hz and nyquist bandwidth is 265 hz
-                                 // acc_d111bw4_n136bw
-                                 // acc_d50bw4_n68bw8
-                                 // acc_d23bw9_n34bw4
-                                 // acc_d11bw5_n17bw
-                                 // acc_d5bw7_n8bw3        - means 3 db bandwidth is 5.7 hz and nyquist bandwidth is 8.3 hz
-                                 // acc_d473bw_n499bw
-
-  myDLPcfg.g = gyr_d5bw7_n8bw9;  // (ICM_20948_GYRO_CONFIG_1_DLPCFG_e)
-                                 // gyr_d196bw6_n229bw8
-                                 // gyr_d151bw8_n187bw6
-                                 // gyr_d119bw5_n154bw3
-                                 // gyr_d51bw2_n73bw3
-                                 // gyr_d23bw9_n35bw9
-                                 // gyr_d11bw6_n17bw8
-                                 // gyr_d5bw7_n8bw9
-                                 // gyr_d361bw4_n376bw5
-
-  result = setDLPFcfg((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), myDLPcfg);
-  if (result > worstResult) worstResult = result;
-  result = enableDLPF(ICM_20948_Internal_Acc, true);
-  if (result > worstResult) worstResult = result;
-  result = enableDLPF(ICM_20948_Internal_Gyr, true);
-  if (result > worstResult) worstResult = result;
-  result = setBank(0);
-  if (result > worstResult) worstResult = result;
-  uint8_t zero = 0;
-  result = write(AGB0_REG_FIFO_EN_1, &zero, 1);
-  if (result > worstResult) worstResult = result;
-  result = write(AGB0_REG_FIFO_EN_2, &zero, 1);
-  if (result > worstResult) worstResult = result;
-  result = intEnableRawDataReady(false);
-  if (result > worstResult) worstResult = result;
-  result = resetFIFO();
-  if (result > worstResult) worstResult = result;
-
-  ICM_20948_smplrt_t mySmplrt;
-  //mySmplrt.g = 19; // ODR is computed as follows: 1.1 kHz/(1+GYRO_SMPLRT_DIV[7:0]). 19 = 55Hz. InvenSense Nucleo example uses 19 (0x13).
-  //mySmplrt.a = 19; // ODR is computed as follows: 1.125 kHz/(1+ACCEL_SMPLRT_DIV[11:0]). 19 = 56.25Hz. InvenSense Nucleo example uses 19 (0x13).
-  mySmplrt.g = 4;  // 225Hz
-  mySmplrt.a = 4;  // 225Hz
-  //mySmplrt.g = 8; // 112Hz
-  //mySmplrt.a = 8; // 112Hz
-  result = setSampleRate((ICM_20948_Internal_Acc | ICM_20948_Internal_Gyr), mySmplrt);
-  if (result > worstResult) worstResult = result;
-  result = setDMPstartAddress();
-  if (result > worstResult) worstResult = result;
-  result = loadDMPFirmware();
-  if (result > worstResult) worstResult = result;
-  result = setDMPstartAddress();
-  if (result > worstResult) worstResult = result;
-  result = setBank(0);
-  if (result > worstResult) worstResult = result;
-  uint8_t fix = 0x48;
-  result = write(AGB0_REG_HW_FIX_DISABLE, &fix, 1);
-  if (result > worstResult) worstResult = result;
-  result = setBank(0);
-  if (result > worstResult) worstResult = result;
-  uint8_t fifoPrio = 0xE4;
-  result = write(AGB0_REG_SINGLE_FIFO_PRIORITY_SEL, &fifoPrio, 1);
-  if (result > worstResult) worstResult = result;
-
-  // Configure Accel scaling to DMP
-  // The DMP scales accel raw data internally to align 1g as 2^25
-  // In order to align internal accel raw data 2^25 = 1g write 0x04000000 when FSR is 4g
-  const unsigned char accScale[4] = { 0x04, 0x00, 0x00, 0x00 };
-  result = writeDMPmems(ACC_SCALE, 4, &accScale[0]);
-  if (result > worstResult) worstResult = result;  // Write accScale to ACC_SCALE DMP register
-  // In order to output hardware unit data as configured FSR write 0x00040000 when FSR is 4g
-  const unsigned char accScale2[4] = { 0x00, 0x04, 0x00, 0x00 };
-  result = writeDMPmems(ACC_SCALE2, 4, &accScale2[0]);
-  if (result > worstResult) worstResult = result;  // Write accScale2 to ACC_SCALE2 DMP register
-
-
-  const unsigned char mountMultiplierZero[4] = { 0x00, 0x00, 0x00, 0x00 };
-  const unsigned char mountMultiplierPlus[4] = { 0x09, 0x99, 0x99, 0x99 };
-  const unsigned char mountMultiplierMinus[4] = { 0xF6, 0x66, 0x66, 0x67 };
-  result = writeDMPmems(CPASS_MTX_00, 4, &mountMultiplierPlus[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(CPASS_MTX_01, 4, &mountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(CPASS_MTX_02, 4, &mountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(CPASS_MTX_10, 4, &mountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(CPASS_MTX_11, 4, &mountMultiplierMinus[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(CPASS_MTX_12, 4, &mountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(CPASS_MTX_20, 4, &mountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(CPASS_MTX_21, 4, &mountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(CPASS_MTX_22, 4, &mountMultiplierMinus[0]);
-  if (result > worstResult) worstResult = result;
-  const unsigned char b2sMountMultiplierZero[4] = { 0x00, 0x00, 0x00, 0x00 };
-  const unsigned char b2sMountMultiplierPlus[4] = { 0x40, 0x00, 0x00, 0x00 };  // Value taken from InvenSense Nucleo example
-  result = writeDMPmems(B2S_MTX_00, 4, &b2sMountMultiplierPlus[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(B2S_MTX_01, 4, &b2sMountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(B2S_MTX_02, 4, &b2sMountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(B2S_MTX_10, 4, &b2sMountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(B2S_MTX_11, 4, &b2sMountMultiplierPlus[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(B2S_MTX_12, 4, &b2sMountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(B2S_MTX_20, 4, &b2sMountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(B2S_MTX_21, 4, &b2sMountMultiplierZero[0]);
-  if (result > worstResult) worstResult = result;
-  result = writeDMPmems(B2S_MTX_22, 4, &b2sMountMultiplierPlus[0]);
-  if (result > worstResult) worstResult = result;
-
-  // Configure the DMP Gyro Scaling Factor
-  // @param[in] gyro_div Value written to GYRO_SMPLRT_DIV register, where
-  //            0=1125Hz sample rate, 1=562.5Hz sample rate, ... 4=225Hz sample rate, ...
-  //            10=102.2727Hz sample rate, ... etc.
-  // @param[in] gyro_level 0=250 dps, 1=500 dps, 2=1000 dps, 3=2000 dps
-  result = setGyroSF(4, 3);
-  if (result > worstResult) worstResult = result;  // 4 = 225Hz (see above), 3 = 2000dps (see above)
-
-  // Configure the Gyro full scale
-  // 2000dps : 2^28
-  // 1000dps : 2^27
-  //  500dps : 2^26
-  //  250dps : 2^25
-  const unsigned char gyroFullScale[4] = { 0x10, 0x00, 0x00, 0x00 };
-  result = writeDMPmems(GYRO_FULLSCALE, 4, &gyroFullScale[0]);
-   if (result > worstResult) worstResult = result;
-
-  // Configure the Accel Only Gain: 15252014 (225Hz) 30504029 (112Hz) 61117001 (56Hz)
-  //const unsigned char accelOnlyGain[4] = {0x03, 0xA4, 0x92, 0x49}; // 56Hz
-  const unsigned char accelOnlyGain[4] = { 0x00, 0xE8, 0xBA, 0x2E };  // 225Hz
-  //const unsigned char accelOnlyGain[4] = {0x01, 0xD1, 0x74, 0x5D}; // 112Hz
-  result = writeDMPmems(ACCEL_ONLY_GAIN, 4, &accelOnlyGain[0]);
-  if (result > worstResult) worstResult = result;
-
-  // Configure the Accel Alpha Var: 1026019965 (225Hz) 977872018 (112Hz) 882002213 (56Hz)
-  //const unsigned char accelAlphaVar[4] = {0x34, 0x92, 0x49, 0x25}; // 56Hz
-  const unsigned char accelAlphaVar[4] = { 0x3D, 0x27, 0xD2, 0x7D };  // 225Hz
-  //const unsigned char accelAlphaVar[4] = {0x3A, 0x49, 0x24, 0x92}; // 112Hz
-  result = writeDMPmems(ACCEL_ALPHA_VAR, 4, &accelAlphaVar[0]);
-  if (result > worstResult) worstResult = result;
-
-  // Configure the Accel A Var: 47721859 (225Hz) 95869806 (112Hz) 191739611 (56Hz)
-  //const unsigned char accelAVar[4] = {0x0B, 0x6D, 0xB6, 0xDB}; // 56Hz
-  const unsigned char accelAVar[4] = { 0x02, 0xD8, 0x2D, 0x83 };  // 225Hz
-  //const unsigned char accelAVar[4] = {0x05, 0xB6, 0xDB, 0x6E}; // 112Hz
-  result = writeDMPmems(ACCEL_A_VAR, 4, &accelAVar[0]);
-  if (result > worstResult) worstResult = result;
-
-  // Configure the Accel Cal Rate
-  const unsigned char accelCalRate[4] = { 0x00, 0x00 };  // Value taken from InvenSense Nucleo example
-  result = writeDMPmems(ACCEL_CAL_RATE, 2, &accelCalRate[0]);
-  if (result > worstResult) worstResult = result;
-
-  // Configure the Compass Time Buffer. The I2C Master ODR Configuration (see above) sets the magnetometer read rate to 68.75Hz.
-  // Let's set the Compass Time Buffer to 69 (Hz).
-  // const unsigned char compassRate[2] = {0x00, 0x45}; // 69Hz
-  const unsigned char compassRate[2] = { 0x00, 0xE1 };  // 225Hz
-  result = writeDMPmems(CPASS_TIME_BUFFER, 2, &compassRate[0]);
-  if (result > worstResult) worstResult = result;
-
-  // Enable DMP interrupt
-  // This would be the most efficient way of getting the DMP data, instead of polling the FIFO
-  //result = intEnableDMP(true); if (result > worstResult) worstResult = result;
-
-  return worstResult;
 }
