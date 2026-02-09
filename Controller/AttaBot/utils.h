@@ -103,9 +103,16 @@ struct pidController {
     differentialError = (abs(pidPwm) < minWorkCycleLimit) ? (error - previousError) / samplingTime : 0;
     pidPwm += pidConst.kd * differentialError;
     pidPwm = kf.Calculate(pidPwm);
-    pidPwm = constrain(pidPwm, -maxWorkCycleLimit, maxWorkCycleLimit);
+
+    // Anti-windup mejorado: si estamos en saturación, no acumular error
+    float constrainedPwm = constrain(pidPwm, -maxWorkCycleLimit, maxWorkCycleLimit);
+    if (abs(constrainedPwm) >= maxWorkCycleLimit && abs(pidPwm) > abs(constrainedPwm)) {
+      // Estamos saturados y queremos ir más allá: revertir acumulación
+      sumError -= error * samplingTime;
+    }
+
     previousError = error;
-    return static_cast<int>(pidPwm);
+    return static_cast<int>(constrainedPwm);
   }
 };
 

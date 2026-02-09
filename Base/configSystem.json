@@ -8,13 +8,15 @@
     "udp_communication": {
         "base_ip": "192.168.1.100",
         "broadcast_ip": "192.168.1.255",
-        "port": 6060
+        "port": 6060,
+        "network_interface": "enp3s0"
     },
     "vision_system": {
         "path_cameraMatrix": "cameraMatrix.txt",
         "path_distance": "dist.txt",
         "debug_resolution": "640x360",
         "camera_resolution": "1920x1080",
+        "camera_index": 2,
         "mmPixel": "39/23",
         "frame_processing_interval": 0.2,
         "distance_between_centers": 45,

@@ -52,8 +52,8 @@
 #define AD0_VAL 1
 #define NUM_LEDS 1
 
-#define PWM_FREQ 1000
-#define PWM_RESOLUTION 14
+#define pwm_freq 1000
+#define pwm_resolution 14
 
 
 // ============================================================================
@@ -83,7 +83,7 @@ const float minSpeed = 12;
 const int speedReductionThreshold = 16;
 
 // Control PID
-const int maxPWMValue = (1 << PWM_RESOLUTION) - 1;
+const int maxPWMValue = (1 << pwm_resolution) - 1;
 const int minPWMValue = maxPWMValue * 0.20;
 pidConstants pidSpeed(110, 375, 2);
 kalmanFilter kfPID(6.0, 1.0, 1.0);
@@ -112,6 +112,14 @@ const char* debugMessage = "DEBUG: %d, ID: %s, Direccion: %c, val: Izq|Der, Enco
 const std::array<int, 7> possibleAngles = { 30, 45, 60, 75, 90, 135, 180 };
 const std::array<int, 4> possibleAdvances = { 200, 250, 300, 350 };
 enum possibleDirections { TURN_POS = 0, MOVE_FORWARD, TURN_NEG };
+
+// Límites del área de trabajo (en milímetros)
+const float max_workspace_x = 2000;
+const float max_workspace_y = 2000;
+
+// Filtro de saltos bruscos en actualización de pose
+const float max_pose_jump = 500;  // Máximo salto permitido en mm por actualización
+const float max_angle_jump = 90;  // Máximo salto permitido en grados
 
 // IMU
 const float gravity = 9806.65;
@@ -338,39 +346,67 @@ void updateMillimetersPerPulse() {
 void setup() {
   #ifdef DebugSerial
     Serial.begin(115200);
+    delay(500);  // Dar tiempo al Serial Monitor para conectar
+    Serial.println("\n\n=== INICIO DE SETUP ===");
   #endif
-  
+
+  // Delay aleatorio para evitar colisiones DHCP cuando múltiples ESP32 arrancan juntos
+  // Usa la MAC address como semilla para que cada robot tenga un delay único
+  randomSeed(ESP.getEfuseMac());
+  unsigned long startupDelay = random(100, 2000);  // Entre 100ms y 2 segundos
+  DebugSerialPrintf("Esperando %lu ms antes de iniciar WiFi...\n", startupDelay);
+  delay(startupDelay);
+
+  DebugSerialPrintln("[1] Inicializando PPR desde flash...");
+  InitializePPR();
+  DebugSerialPrintln("[1] PPR OK");
+
+  DebugSerialPrintln("[2] Inicializando servo...");
   frontServo.setPeriodHertz(50);
   frontServo.attach(frontServoPin, 1000, 2000);
   frontServo.write(90);
+  DebugSerialPrintln("[2] Servo OK");
 
-  ledcAttach(leftMotorForward, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttach(leftMotorBackward, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttach(rightMotorForward, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttach(rightMotorBackward, PWM_FREQ, PWM_RESOLUTION);
+  DebugSerialPrintln("[3] Inicializando motores PWM...");
+  ledcAttach(leftMotorForward, pwm_freq, pwm_resolution);
+  ledcAttach(leftMotorBackward, pwm_freq, pwm_resolution);
+  ledcAttach(rightMotorForward, pwm_freq, pwm_resolution);
+  ledcAttach(rightMotorBackward, pwm_freq, pwm_resolution);
+  DebugSerialPrintln("[3] Motores OK");
 
+  DebugSerialPrintln("[4] Inicializando I2C...");
+  Wire.begin();
+  Wire.setClock(400000);
+  DebugSerialPrintln("[4] I2C OK");
+
+  // IMPORTANTE: setHostname DEBE estar ANTES de WiFi.begin()
+  DebugSerialPrintln("[5] Inicializando WiFi...");
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
   String hostname = "AttaBot-" + String((uint32_t)ESP.getEfuseMac(), HEX);
   WiFi.setHostname(hostname.c_str());
 
+  DebugSerialPrintf("Iniciando WiFi con hostname: %s\n", hostname.c_str());
+  WiFi.begin(ssid, password);
+  DebugSerialPrintln("[5] WiFi iniciado");
+
+  DebugSerialPrintln("[6] Inicializando LEDs...");
   FastLED.addLeds<WS2812, ledPin, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(maxBrightness);
   FastLED.setMaxRefreshRate(120);
   ledCtrl.setOff();
+  DebugSerialPrintln("[6] LEDs OK");
 
+  DebugSerialPrintln("[7] Inicializando OTA y UDP...");
   ArduinoOTA.setHostname(hostname.c_str());
   ArduinoOTA.begin();
 
   udp.begin(localPort);
   DebugSerialPrintf("El servidor UDP se inició en el puerto: %u\n", localPort);
-  Wire.begin();
-  Wire.setClock(400000);
-  InitializePPR();
+  DebugSerialPrintln("[7] OTA y UDP OK");
 
+  DebugSerialPrintln("[8] Configurando encoders...");
   pinMode(leftEncoderC1, INPUT_PULLUP);
-  pinMode(leftEncoderC2, INPUT_PULLUP);
+  pinMode(leftEncoderC2, INPUT);  // GPIO 35 es input-only, sin pull-up (compatible con ESP32 Core 3.x)
   pinMode(rightEncoderC1, INPUT_PULLUP);
   pinMode(rightEncoderC2, INPUT_PULLUP);
 
@@ -378,7 +414,9 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(leftEncoderC2), LeftWheelPulses, CHANGE);
   attachInterrupt(digitalPinToInterrupt(rightEncoderC1), RightWheelPulses, CHANGE);
   attachInterrupt(digitalPinToInterrupt(rightEncoderC2), RightWheelPulses, CHANGE);
+  DebugSerialPrintln("[8] Encoders OK");
 
+  DebugSerialPrintln("[9] Configurando sensores infrarrojos...");
   pinMode(enableLeftInfraredSensor, OUTPUT);
   pinMode(enableRightInfraredSensor, OUTPUT);
 
@@ -391,7 +429,11 @@ void setup() {
   pinMode(rightInfraredSensor, INPUT);
   attachInterrupt(digitalPinToInterrupt(leftInfraredSensor), DetectLeftObstacle, FALLING);
   attachInterrupt(digitalPinToInterrupt(rightInfraredSensor), DetectRightObstacle, FALLING);
+  DebugSerialPrintln("[9] Sensores OK");
 
+  DebugSerialPrintln("\n=== SETUP COMPLETO ===\n");
+
+  
   SetupFrontSensor();
   delay(200);
 }
@@ -662,21 +704,19 @@ void loop() {
     }
 
     case ACTIVE_EVASION: {
-      // Validación 1: Verificar que hay un obstáculo válido
       if (obstacles.obstacleSensors == 0 || !obstacles.HasAnyObstacle()) {
-        MessageDebugf("DEBUG: -1, ID: %s, ⚠️ ACTIVE_EVASION sin obstáculo válido. Abortando.", 
+        MessageDebugf("DEBUG: -1, ID: %s, ACTIVE_EVASION sin obstáculo válido. Abortando.", 
                       robotID.c_str());
         obstacles.Clear();
         state = READ_INSTRUCTION;
         break;
       }
       
-      // Validación 2: Verificar que los datos no sean muy antiguos
       unsigned long timeSinceDetection = millis() - evasionStartTime;
       if (timeSinceDetection > 1500) {
-        MessageDebugf("DEBUG: -1, ID: %s, ⚠️ Datos de obstáculo obsoletos (%lums). Re-escaneando.", 
+        MessageDebugf("DEBUG: -1, ID: %s, Datos de obstáculo obsoletos (%lums). Re-escaneando.", 
                       robotID.c_str(), timeSinceDetection);
-        state = STOP;  // Volver a escanear
+        state = STOP; 
         break;
       }
       
@@ -687,7 +727,7 @@ void loop() {
       bool needsRetreat = evasionTracker.ShouldRetreat();
       
       if (needsRetreat) {
-        MessageDebugf("DEBUG: -1, ID: %s, 🔴 Ejecutando retroceso forzado (evasiones: %d)", 
+        MessageDebugf("DEBUG: -1, ID: %s, Ejecutando retroceso forzado (evasiones: %d)", 
                       robotID.c_str(), evasionTracker.consecutiveEvasions);
         
         std::deque<std::array<float, 2>> retreatSequence;
@@ -711,69 +751,71 @@ void loop() {
         evasionTracker.Reset();
         
       } else {
-        // Estrategia de evasión basada en patrón de sensores
-        if (obstacles.obstacleSensors == 0b100) {  // Solo izquierda
+        if (obstacles.obstacleSensors == 0b100) {  
           avoidanceAngle = 45;
           avoidanceDistance = 200;
-        } else if (obstacles.obstacleSensors == 0b001) {  // Solo derecha
+        } else if (obstacles.obstacleSensors == 0b001) {  
           avoidanceAngle = -45;
           avoidanceDistance = 200;
-        } else if (obstacles.obstacleSensors == 0b010) {  // Solo central
+        } else if (obstacles.obstacleSensors == 0b010) {  
           avoidanceAngle = (random(2) == 0) ? 60 : -60;
           avoidanceDistance = 250;
-        } else if (obstacles.obstacleSensors == 0b110) {  // Izquierda + Central
+        } else if (obstacles.obstacleSensors == 0b110) {  
           avoidanceAngle = 90;
           avoidanceDistance = 150;
-        } else if (obstacles.obstacleSensors == 0b011) {  // Central + Derecha
+        } else if (obstacles.obstacleSensors == 0b011) {  
           avoidanceAngle = -90;
           avoidanceDistance = 150;
-        } else if (obstacles.obstacleSensors == 0b111) {  // Todos
+        } else if (obstacles.obstacleSensors == 0b111) {  
           avoidanceAngle = (random(2) == 0) ? 135 : -135;
           avoidanceDistance = 100;
         }
-        
+
+        if (!obstacles.HasAnyObstacle()) {
+          MessageDebugf("DEBUG: -1, ID: %s, Obstáculo desapareció durante cálculo de evasión",
+                        robotID.c_str());
+          obstacles.Clear();
+          state = READ_INSTRUCTION;
+          break;
+        }
+
         std::deque<std::array<float, 2>> evasionSequence;
-        
-        // Retroceso si hay obstáculo frontal
+
         if (obstacles.obstacleSensors & 0b010 || obstacles.obstacleSensors == 0b111) {
           fsmInstruction[0] = REVERSE;
           fsmInstruction[1] = reverseDistance * 1.5;
           evasionSequence.push_back(fsmInstruction);
         }
-        
-        // Giro de evasión
+
         if (avoidanceAngle != 0) {
           fsmInstruction[0] = TURN;
           fsmInstruction[1] = radians(avoidanceAngle) * centerToWheelDistance;
           evasionSequence.push_back(fsmInstruction);
         }
-        
-        // Avance para despejar
+
         if (avoidanceDistance > 0) {
           fsmInstruction[0] = MOVE;
           fsmInstruction[1] = avoidanceDistance;
           evasionSequence.push_back(fsmInstruction);
         }
-        
+
         for (auto it = evasionSequence.rbegin(); it != evasionSequence.rend(); ++it) {
           instructionList.push_front(*it);
         }
       }
-      
-      // Programar resumption si fue interrumpido
+    
       if (intContext.wasInterrupted && !resumeScheduled) {
         fsmInstruction[0] = RESUME_AFTER_EVASION;
         fsmInstruction[1] = 0;
         instructionList.push_back(fsmInstruction);
         resumeScheduled = true;
       }
-      
-      // NO borrar obstacles aquí - se borra en próximo READ_INSTRUCTION
+  
       obstacleDetected = false;
       
       state = READ_INSTRUCTION;
       
-      MessageDebugf("DEBUG: -1, ID: %s, ✅ Evasión: patrón=%s, giro=%d°, avance=%dmm, forzado=%d", 
+      MessageDebugf("DEBUG: -1, ID: %s, Evasión: patrón=%s, giro=%d°, avance=%dmm, forzado=%d", 
                     robotID.c_str(), 
                     obstacles.GetObstaclePattern().c_str(),
                     avoidanceAngle, 
@@ -786,30 +828,27 @@ void loop() {
     case RESUME_AFTER_EVASION: {
       if (!intContext.wasInterrupted) {
         resumeScheduled = false;
-        obstacles.Clear();  // Ahora sí limpiamos
+        obstacles.Clear(); 
         state = READ_INSTRUCTION;
         break;
       }
       
-      MessageDebugf("DEBUG: -1, ID: %s, 🔄 Resumiendo: estado=%d, valor=%.1f, navActive=%d", 
+      MessageDebugf("DEBUG: -1, ID: %s, Resumiendo: estado=%d, valor=%.1f, navActive=%d", 
                     robotID.c_str(), 
                     intContext.previousState, 
                     intContext.remainingValue,
                     navTarget.isActive);
       
-      // IMPORTANTE: Si hay navegación activa, NO reanudar con valores absolutos
-      // Siempre recalcular desde posición actual
       if (navTarget.isActive) {
-        MessageDebugf("DEBUG: -1, ID: %s, ℹ️ Navegación activa: recalculando ruta en lugar de reanudar", 
+        MessageDebugf("DEBUG: -1, ID: %s, Navegación activa: recalculando ruta en lugar de reanudar", 
                       robotID.c_str());
         
-        // Ir directo a REQUEST_POSITION para recalcular
+        
         fsmInstruction[0] = REQUEST_POSITION;
         fsmInstruction[1] = 0;
         instructionList.push_front(fsmInstruction);
         
       } else {
-        // Solo reanudar si NO es navegación iterativa
         switch (intContext.previousState) {
           case MOVE: {
             if (intContext.remainingValue > 20) {
@@ -817,7 +856,7 @@ void loop() {
               fsmInstruction[1] = intContext.remainingValue;
               instructionList.push_front(fsmInstruction);
               
-              MessageDebugf("DEBUG: -1, ID: %s, ↪️ Reanudando MOVE: %.1fmm restantes", 
+              MessageDebugf("DEBUG: -1, ID: %s, Reanudando MOVE: %.1fmm restantes", 
                             robotID.c_str(), intContext.remainingValue);
             }
             break;
@@ -830,7 +869,7 @@ void loop() {
               fsmInstruction[1] = intContext.remainingValue;
               instructionList.push_front(fsmInstruction);
               
-              MessageDebugf("DEBUG: -1, ID: %s, ↪️ Reanudando TURN: %.1f° restantes", 
+              MessageDebugf("DEBUG: -1, ID: %s, Reanudando TURN: %.1f° restantes", 
                             robotID.c_str(), angleRemaining);
             }
             break;
@@ -841,9 +880,8 @@ void loop() {
       intContext.Clear();
       resumeScheduled = false;
       isEvading = false;
-      obstacles.Clear();  // Limpiar ahora
+      obstacles.Clear();
       
-      // Resetear evasion tracker con cooldown
       evasionTracker.Reset();
       
       state = READ_INSTRUCTION;
@@ -860,9 +898,9 @@ void loop() {
 void InitiateIterativeNavigation(float targetX, float targetY) {
     navTarget.targetX = targetX;
     navTarget.targetY = targetY;
-    navTarget.StartNavigation();  // Usa el nuevo método
+    navTarget.StartNavigation(); 
     
-    MessageDebugf("DEBUG: -1, ID: %s, 🎯 Navegación iterativa iniciada: objetivo=(%.1f, %.1f)", 
+    MessageDebugf("DEBUG: -1, ID: %s, Navegación iterativa iniciada: objetivo=(%.1f, %.1f)", 
                   robotID.c_str(), targetX, targetY);
     
     fsmInstruction[0] = REQUEST_POSITION;
@@ -877,17 +915,15 @@ void CalculateIterativeMovement() {
         return;
     }
     
-    // Validación 1: Máximo de iteraciones
     if (navTarget.HasExceededMaxIterations()) {
-        MessageDebugf("DEBUG: -1, ID: %s, ⚠️ Límite de iteraciones alcanzado (%d). Abortando navegación.", 
+        MessageDebugf("DEBUG: -1, ID: %s, Límite de iteraciones alcanzado (%d). Abortando navegación.", 
                       robotID.c_str(), navTarget.maxIterations);
         navTarget.Reset();
         return;
     }
     
-    // Validación 2: Timeout total
     if (navTarget.HasTimedOut()) {
-        MessageDebugf("DEBUG: -1, ID: %s, ⏱️ Timeout de navegación (>5min). Abortando.", 
+        MessageDebugf("DEBUG: -1, ID: %s, Timeout de navegación (>5min). Abortando.", 
                       robotID.c_str());
         navTarget.Reset();
         return;
@@ -904,28 +940,24 @@ void CalculateIterativeMovement() {
                   robotPose.x, robotPose.y, 
                   navTarget.targetX, navTarget.targetY, totalDistance);
     
-    // Validación 3: Detección de loops
     if (navTarget.IsInLoop(robotPose.x, robotPose.y)) {
-        MessageDebugf("DEBUG: -1, ID: %s, 🔄 LOOP DETECTADO. Abortando navegación.", 
+        MessageDebugf("DEBUG: -1, ID: %s, LOOP DETECTADO. Abortando navegación.", 
                       robotID.c_str());
         navTarget.Reset();
         return;
     }
     
-    // Validación 4: Progreso
     if (!navTarget.IsMakingProgress(totalDistance)) {
-        MessageDebugf("DEBUG: -1, ID: %s, 📉 Sin progreso en %d iteraciones. Abortando.", 
+        MessageDebugf("DEBUG: -1, ID: %s, Sin progreso en %d iteraciones. Abortando.", 
                       robotID.c_str(), navTarget.maxIterationsWithoutProgress);
         navTarget.Reset();
         return;
     }
     
-    // Registrar posición actual
     navTarget.RecordPosition(robotPose.x, robotPose.y);
     
-    // Verificar si llegamos
     if (totalDistance < navTarget.arrivalThreshold) {
-        MessageDebugf("DEBUG: -1, ID: %s, ✅ Objetivo alcanzado. Distancia final: %.1fmm (iteraciones: %d)", 
+        MessageDebugf("DEBUG: -1, ID: %s, Objetivo alcanzado. Distancia final: %.1fmm (iteraciones: %d)", 
                       robotID.c_str(), totalDistance, navTarget.currentIteration);
         navTarget.Reset();
         return;
@@ -953,7 +985,6 @@ void CalculateIterativeMovement() {
                   navTarget.maxIterationsWithoutProgress - navTarget.iterationsWithoutProgress,
                   navTarget.maxIterationsWithoutProgress);
     
-    // Programar movimientos
     if (abs(angleDiff) > 5) {
         fsmInstruction[0] = TURN;
         fsmInstruction[1] = radians(angleDiff) * centerToWheelDistance;
@@ -982,33 +1013,106 @@ void CalculateIterativeMovement() {
 
 void SetupFrontSensor() {
   if (frontSensorInitialized) return;
-  
+
   unsigned long now = millis();
-  if (now - lastFrontSensorAttempt < frontSensorRetryInterval) return;
+  
+  // CORRECCIÓN CLAVE: Permite la ejecución si es el primer intento (lastFrontSensorAttempt == 0),
+  // o si han pasado 5 segundos desde el último intento fallido.
+  if (lastFrontSensorAttempt != 0 && (now - lastFrontSensorAttempt < frontSensorRetryInterval)) {
+      return;
+  }
   
   lastFrontSensorAttempt = now;
+  
+  DebugSerialPrintln("Intentando inicializar APDS9960...");
+
+    
   
   if (frontSensor.begin()) {
     frontSensorInitialized = true;
     ledCtrl.setOff();
-    DebugSerialPrintln("✅ Sensor APDS-9960 inicializado correctamente");
+    DebugSerialPrintln(" Sensor APDS-9960 inicializado correctamente");
   } else {
-    DebugSerialPrintln("⚠️ Falló la inicialización del sensor APDS-9960. Reintentando...");
+    DebugSerialPrintln(" Falló la inicialización del sensor APDS-9960. Reintentando...");
     ledCtrl.setBlink(255, 128, 0, maxBrightness, 500);
   }
 }
 
 void WiFiStatus() {
+  static uint8_t lastStatus = 255;  // Inicializar con valor inválido
+  uint8_t currentStatus = WiFi.status();
+
+  // Debug: mostrar cambios de estado
+  if (currentStatus != lastStatus) {
+    const char* statusStr[] = {
+      "WL_IDLE_STATUS",      // 0
+      "WL_NO_SSID_AVAIL",    // 1
+      "WL_SCAN_COMPLETED",   // 2
+      "WL_CONNECTED",        // 3
+      "WL_CONNECT_FAILED",   // 4
+      "WL_CONNECTION_LOST",  // 5
+      "WL_DISCONNECTED"      // 6
+    };
+    if (currentStatus <= 6) {
+      DebugSerialPrintf("WiFi Status cambió: %s (%d)\n", statusStr[currentStatus], currentStatus);
+    }
+    lastStatus = currentStatus;
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
     static bool wifiConnecting = false;
+    static unsigned long lastWifiAttempt = 0;
+    static int retryCount = 0;
+
     if (!wifiConnecting) {
       ConfigureHBridge(0, 0);
-      DebugSerialPrintln("Conectando WiFi ...");
+      DebugSerialPrintln("=== Iniciando conexión WiFi ===");
+      DebugSerialPrintf("SSID: %s\n", ssid);
+      DebugSerialPrintf("MAC: %s\n", WiFi.macAddress().c_str());
+      DebugSerialPrintf("Hostname: %s\n", WiFi.getHostname());
       ledCtrl.setBlink(0, 255, 255, maxBrightness, 250);
       wifiConnecting = true;
+      lastWifiAttempt = millis();
+      retryCount = 0;
     }
+
+    // Timeout de conexión: reintentar después de 10 segundos
+    if (millis() - lastWifiAttempt > 10000) {
+      retryCount++;
+      DebugSerialPrintf("⚠ Timeout WiFi (intento #%d). Estado: %d\n", retryCount, WiFi.status());
+
+      // Después de 3 intentos, hacer un reset más agresivo
+      if (retryCount >= 3) {
+        DebugSerialPrintln("🔴 Múltiples fallos. Reiniciando WiFi completamente...");
+        WiFi.mode(WIFI_OFF);
+        delay(500);
+        WiFi.mode(WIFI_STA);
+        String hostname = "AttaBot-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+        WiFi.setHostname(hostname.c_str());
+        retryCount = 0;
+      }
+
+      WiFi.disconnect();
+      delay(100);
+      WiFi.begin(ssid, password);
+      lastWifiAttempt = millis();
+    }
+
     return;
   } else {
+    static bool firstConnect = true;
+    if (firstConnect) {
+      DebugSerialPrintln("=== ✓ WiFi CONECTADO ===");
+      DebugSerialPrintf("IP: %s\n", WiFi.localIP().toString().c_str());
+      DebugSerialPrintf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
+      DebugSerialPrintf("Subnet: %s\n", WiFi.subnetMask().toString().c_str());
+      DebugSerialPrintf("DNS: %s\n", WiFi.dnsIP().toString().c_str());
+      DebugSerialPrintf("MAC: %s\n", WiFi.macAddress().c_str());
+      DebugSerialPrintf("Hostname: %s\n", WiFi.getHostname());
+      DebugSerialPrintf("RSSI: %d dBm\n", WiFi.RSSI());
+      DebugSerialPrintln("=======================");
+      firstConnect = false;
+    }
     ledCtrl.setOff();
   }
 }
@@ -1026,30 +1130,47 @@ void ReadSensors() {
         lateralSensorsEnabled = isLateralCycleActive;
         digitalWrite(enableLeftInfraredSensor, lateralSensorsEnabled);
         digitalWrite(enableRightInfraredSensor, lateralSensorsEnabled);
-      
-        // Resetear tiempos cuando se reactiva
+
         if (lateralSensorsEnabled) {
+          noInterrupts();
           leftObsStartTime = micros();
           rightObsStartTime = micros();
+          interrupts();
         }
       }
 
       isCentralCycleActive = (centralCycle == cycleCounter);
-      frontSensor.enableProximity(isCentralCycleActive);
+      
+      // GUARDIA 1: Solo intenta habilitar la proximidad si el sensor ya está inicializado.
+      if (frontSensorInitialized) { 
+          frontSensor.enableProximity(isCentralCycleActive);
+      }
     }
 
     if (isLateralCycleActive) {
-      obstacles.leftObstacle = (digitalRead(leftInfraredSensor) == LOW) && ((micros() - leftObsStartTime) >= minObstacleTime);
-      obstacles.rightObstacle = (digitalRead(rightInfraredSensor) == LOW) && ((micros() - rightObsStartTime) >= minObstacleTime);
+      noInterrupts();
+      unsigned long leftTime = leftObsStartTime;
+      unsigned long rightTime = rightObsStartTime;
+      interrupts();
+
+      unsigned long now = micros();
+      obstacles.leftObstacle = (digitalRead(leftInfraredSensor) == LOW) && ((now - leftTime) >= minObstacleTime);
+      obstacles.rightObstacle = (digitalRead(rightInfraredSensor) == LOW) && ((now - rightTime) >= minObstacleTime);
     }
 
     if (isCentralCycleActive) {
-      centralDistance = frontSensor.readProximity();
-      if (centralDistance > 2) {
-        obstacles.centralObstacle = (micros() - centralObsStartTime) >= minObstacleTime / 2;
+      // GUARDIA 2: Solo intenta leer la proximidad si el sensor ya está inicializado.
+      if (frontSensorInitialized) { 
+          centralDistance = frontSensor.readProximity();
+          if (centralDistance > 2) {
+            obstacles.centralObstacle = (micros() - centralObsStartTime) >= minObstacleTime / 2;
+          } else {
+            centralObsStartTime = micros();
+            obstacles.centralObstacle = false;
+          }
       } else {
-        centralObsStartTime = micros();
-        obstacles.centralObstacle = false;
+          // Si no está inicializado, asumimos que no hay obstáculo
+          obstacles.centralObstacle = false; 
       }
     }
   }
@@ -1379,9 +1500,30 @@ void ReadUdpPackets() {
   
   // POSE
   else if (command == "POSE") {
-    robotPose.x = arguments[1].toFloat();
-    robotPose.y = arguments[2].toFloat();
-    robotPose.angle = arguments[3].toFloat();
+    float newX = arguments[1].toFloat();
+    float newY = arguments[2].toFloat();
+    float newAngle = arguments[3].toFloat();
+
+    if (robotPose.x != 0 || robotPose.y != 0) {  
+      float deltaX = newX - robotPose.x;
+      float deltaY = newY - robotPose.y;
+      float distanceJump = sqrt(deltaX * deltaX + deltaY * deltaY);
+
+      float angleDiff = NormalizeAngle(newAngle - robotPose.angle);
+
+      if (distanceJump > max_pose_jump || abs(angleDiff) > max_angle_jump) {
+        char buffer[150];
+        snprintf(buffer, sizeof(buffer),
+                "WARNING: Salto brusco detectado. ΔPos=%.1fmm, ΔAng=%.1f°. Ignorando actualización.",
+                distanceJump, angleDiff);
+        MessageDebugf("DEBUG: -1, ID: %s, %s", robotID.c_str(), buffer);
+        return;
+      }
+    }
+
+    robotPose.x = newX;
+    robotPose.y = newY;
+    robotPose.angle = newAngle;
   }
   
   // SETPPR
@@ -1492,17 +1634,27 @@ void ReadUdpPackets() {
   else if (command == "POSITIONGT") {
     float targetX = arguments[1].toFloat();
     float targetY = arguments[2].toFloat();
-    
+
+    if (abs(targetX) > max_workspace_x || abs(targetY) > max_workspace_y) {
+      char buffer[100];
+      snprintf(buffer, sizeof(buffer),
+              "ERROR: Objetivo fuera de rango. X=%.1f (max=%.1f), Y=%.1f (max=%.1f)",
+              targetX, max_workspace_x, targetY, max_workspace_y);
+      SendMessage(robots["Base"], buffer);
+      MessageDebugf("DEBUG: -1, ID: %s, %s", robotID.c_str(), buffer);
+      return;
+    }
+
     if (arguments[3] != "") {
       float customSegmentDist = arguments[3].toFloat();
       if (customSegmentDist >= 50 && customSegmentDist <= 400) {
         navTarget.segmentDistance = customSegmentDist;
       }
     }
-    
-    MessageDebugf("DEBUG: -1, ID: %s, Objetivo global recibido: x=%.1f, y=%.1f, segDist=%.1fmm", 
+
+    MessageDebugf("DEBUG: -1, ID: %s, Objetivo global recibido: x=%.1f, y=%.1f, segDist=%.1fmm",
                   robotID.c_str(), targetX, targetY, navTarget.segmentDistance);
-    
+
     InitiateIterativeNavigation(targetX, targetY);
   }
   

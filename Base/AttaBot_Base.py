@@ -1,5 +1,6 @@
-import cv2, json, math, time, socket, threading, os, csv, multiprocessing, threading
+import cv2, json, math, time, socket, threading, os, csv, multiprocessing, threading, platform
 import numpy as np
+import readline
 from datetime import datetime
 
 
@@ -667,27 +668,63 @@ class Base(object):
         """
         Configura la comunicación UDP para el sistema.
 
-        Este método establece la dirección IP base, la dirección IP de broadcast y el puerto 
-        para la comunicación UDP, ademas, crea un socket UDP. También habilita la opción de 
+        Este método establece la dirección IP base, la dirección IP de broadcast y el puerto
+        para la comunicación UDP, ademas, crea un socket UDP. También habilita la opción de
         broadcast en el socket.
 
         Parámetros:
-        configuration (dict): Un diccionario que contiene la configuración de UDP, 
+        configuration (dict): Un diccionario que contiene la configuración de UDP,
                             que incluye:
             - 'base_ip' (str): La dirección IP base del sistema.
             - 'broadcast_ip' (str): La dirección IP de broadcast.
             - 'port' (int): El puerto a utilizar para la comunicación UDP.
+            - 'network_interface' (str, opcional): Nombre de la interfaz de red a usar
+                                                   (ej: 'enp3s0', 'eth0', 'wlan0').
         """
         self.baseIP = configuration['base_ip']
         self.broadcastIP =  configuration['broadcast_ip']
         self.port = configuration['port']
+        self.networkInterface = configuration.get('network_interface', None)
 
         # Crear socket UDP
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # En Linux, agregar SO_REUSEPORT para mejor manejo de puerto
+        if platform.system() == 'Linux':
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                print('✓ SO_REUSEPORT habilitado (Linux)')
+            except AttributeError:
+                # Versiones antiguas de Python pueden no tener SO_REUSEPORT
+                print('⚠ SO_REUSEPORT no disponible en esta versión de Python')
+
+            # Vincular socket a la interfaz de red específica para evitar conflictos
+            # con otras interfaces activas (WiFi, Docker, etc.)
+            if self.networkInterface:
+                try:
+                    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                                       self.networkInterface.encode())
+                    print(f'✓ Socket vinculado a interfaz {self.networkInterface}')
+                except (AttributeError, OSError) as e:
+                    print(f'⚠ No se pudo vincular a interfaz {self.networkInterface}: {e}')
+                    print('  El socket usará el enrutamiento por defecto del sistema')
+
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**20)
-        self.sock.bind((self.baseIP, self.port))
+
+        try:
+            self.sock.bind((self.baseIP, self.port))
+            print(f'✓ Socket UDP bind exitoso en {self.baseIP}:{self.port}')
+        except OSError as e:
+            print(f'Error al hacer bind en {self.baseIP}:{self.port}')
+            print(f'Motivo: {e}')
+            print('\nSoluciones posibles:')
+            print('  1. Verifica que la IP sea correcta para tu interfaz de red')
+            print(f'  2. Prueba con bind en "0.0.0.0" para escuchar en todas las interfaces')
+            print(f'  3. Asegúrate de que el puerto {self.port} no esté en uso')
+            print('  4. Ejecuta: sudo netstat -tulpn | grep {}'.format(self.port))
+            raise
 
 
 
@@ -730,22 +767,55 @@ class Base(object):
         """
         Inicializa la captura de video desde la cámara.
 
-        Este método configura la cámara utilizando OpenCV, estableciendo la resolución de 
-        la cámara y la resolución para depuración. Si la cámara no se puede abrir, se 
+        Este método configura la cámara utilizando OpenCV, estableciendo la resolución de
+        la cámara y la resolución para depuración. Si la cámara no se puede abrir, se
         imprime un mensaje de error y se finaliza el programa.
 
         Parámetros:
-        configuration (dict): Un diccionario que contiene la configuración de la cámara, 
+        configuration (dict): Un diccionario que contiene la configuración de la cámara,
                             que incluye:
             - 'debug_resolution' (str): La resolución de depuración en formato 'ancho x alto'.
             - 'camera_resolution' (str): La resolución de la cámara en formato 'ancho x alto'.
-        
+            - 'camera_index' (int, opcional): Índice de la cámara (default: auto-detect)
+
         Raises:
             SystemExit: Si no se puede abrir la cámara.
         """
 
-        # Inicializa la captura de video (0 es el ID de la cámara predeterminada)
-        self.camera = cv2.VideoCapture(2, cv2.CAP_V4L) # CAP_DSHOW, CAP_MSMF
+        # Detectar sistema operativo y backend apropiado
+        system = platform.system()
+        if system == 'Linux':
+            backend = cv2.CAP_V4L2  # V4L2 es más estable que V4L en Linux moderno
+        elif system == 'Windows':
+            backend = cv2.CAP_DSHOW  # DirectShow para Windows
+        elif system == 'Darwin':  # macOS
+            backend = cv2.CAP_AVFOUNDATION
+        else:
+            backend = cv2.CAP_ANY  # Fallback
+
+        # Intentar obtener índice de cámara de configuración
+        camera_index = configuration.get('camera_index', None)
+
+        # Auto-detectar cámara si no se especifica
+        if camera_index is None:
+            print(f'Detectando cámara en {system}...')
+            for i in range(5):  # Probar índices 0-4
+                test_cam = cv2.VideoCapture(i, backend)
+                if test_cam.isOpened():
+                    camera_index = i
+                    test_cam.release()
+                    print(f'✓ Cámara encontrada en índice {i}')
+                    break
+
+            if camera_index is None:
+                print('Error: No se detectó ninguna cámara.')
+                print('Intenta especificar "camera_index" en configSystem.json')
+                exit()
+
+        # Inicializar cámara con backend apropiado
+        self.camera = cv2.VideoCapture(camera_index, backend)
+        print(f'Backend de cámara: {backend} (índice {camera_index})')
+
         self.debugResolution = tuple(map(int, configuration['debug_resolution'].split('x')))
         width, height = map(int, configuration['camera_resolution'].split('x'))
         self.cameraResolution = (height, width)
@@ -753,7 +823,13 @@ class Base(object):
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
         if not self.camera.isOpened():
-            print('Error: No se pudo abrir la cámara.')
+            print(f'Error: No se pudo abrir la cámara {camera_index}.')
+            print('Cámaras disponibles en tu sistema:')
+            for i in range(5):
+                test = cv2.VideoCapture(i, backend)
+                if test.isOpened():
+                    print(f'  - /dev/video{i} (índice {i})')
+                    test.release()
             exit()
 
 
@@ -826,22 +902,23 @@ class Base(object):
             self.frameColors.pop(color)
 
 
-    def setupRobots(self, robotIP, robotsIPs):
+    def setupRobots(self, robotIP, robotsIPs, configuredRobots):
         """
         Asocia una dirección IP a un robot en función de la detección del sistema de visión.
 
-        Si no se proporciona una dirección IP se selecciona una de robotsIPs, despues se 
-        gira el robot para identificar cuál se mueve y se le asigna la dirección IP 
-        selecciona. 
+        Si no se proporciona una dirección IP se selecciona una de robotsIPs, despues se
+        gira el robot para identificar cuál se mueve y se le asigna la dirección IP
+        selecciona.
 
         Parameters:
         - robotIP (str o None): Dirección IP actual del robot. Si es None, se
         seleccionara una nueva IP.
         - robotsIPs (list): Lista de direcciones IP disponibles para asignar a los robots.
+        - configuredRobots (set): Conjunto de IDs de robots ya configurados.
 
         Returns:
-        - tuple: Contiene una dirección IP asociada a un robot y un booleano que indica 
-        si se obtuvo un frame válido (True si se asoció correctamente, False si se 
+        - tuple: Contiene una dirección IP asociada a un robot y un booleano que indica
+        si se obtuvo un frame válido (True si se asoció correctamente, False si se
         tuvo que mover el robot para asignar una IP).
 
         Nota:
@@ -851,9 +928,9 @@ class Base(object):
             robotIP = self.setupMoveRobot(robotsIPs)
             isValidFrame = False
         else:
-            robotIP = self.setupRobotIP(robotsIPs)
+            robotIP = self.setupRobotIP(robotsIPs, configuredRobots)
             isValidFrame = True
-        
+
         if len(robotsIPs) == 0:
             self.printRobots()
             time.sleep(0.5)
@@ -878,28 +955,34 @@ class Base(object):
             print(f"\t{robot.id}. {robot.name}, con IP: {robot.IP}")
 
 
-    def setupRobotIP(self, robotsIPs):
+    def setupRobotIP(self, robotsIPs, configuredRobots):
         """
         Asocia una dirección IP a un robot en función de su desplazamiento angular.
 
-        La función itera sobre los robots detectados y verifica el desplazamiento 
-        angular de cada uno. Si el desplazamiento angular es mayor o igual a 45 grados, 
-        se asigna la última dirección IP disponible de la lista `robotsIPs` a ese robot 
+        La función itera sobre los robots detectados y verifica el desplazamiento
+        angular de cada uno. Si el desplazamiento angular es mayor o igual a 45 grados,
+        se asigna la última dirección IP disponible de la lista `robotsIPs` a ese robot
         y se realiza la configuración de la IP.
 
         Parameters:
         - robotsIPs (list): Lista de direcciones IP disponibles para los robots.
+        - configuredRobots (set): Conjunto de IDs de robots ya configurados.
 
         Returns:
         - None
         """
         for robot in self.robots.values():
+            # Ignorar robots ya configurados
+            if robot.id in configuredRobots:
+                continue
+
             displacement = robot.getDisplacement()
             if displacement != None:
                 _, angularDisplacement = displacement
                 if abs(angularDisplacement) >= 45:
                     robotIP = robotsIPs.pop()
                     robot.setupIP(robotIP)
+                    configuredRobots.add(robot.id)
                     break
 
         return None
@@ -943,14 +1026,14 @@ class Base(object):
         """
         Procesa los fotogramas de la cámara para el seguimiento y control de los robots.
 
-        Esta función se encarga de leer los fotogramas de la cámara, 
-        aplicar el procesamiento de color y buscar los robots en 
-        función de su configuración. Controla el intervalo de 
-        procesamiento para asegurar que los fotogramas se manejen 
-        adecuadamente y gestiona la inicialización de la grabación de 
+        Esta función se encarga de leer los fotogramas de la cámara,
+        aplicar el procesamiento de color y buscar los robots en
+        función de su configuración. Controla el intervalo de
+        procesamiento para asegurar que los fotogramas se manejen
+        adecuadamente y gestiona la inicialización de la grabación de
         video y el registro de tiempos.
 
-        Durante la ejecución, busca robots en el color definido y 
+        Durante la ejecución, busca robots en el color definido y
         envía las posiciones de los robots encontrados.
 
         Retorna:
@@ -960,6 +1043,7 @@ class Base(object):
         isValidFrame = True
         robotsIPs = []
         foundRobots = set()
+        configuredRobots = set()  # Rastrea robots ya configurados con IP
         lastProcessedTime = time.time()
         executed = False
 
@@ -982,7 +1066,7 @@ class Base(object):
                     robotsIPs = self.searchRobotsUdp()
                     self.processFoundRobots(foundRobots, foundColors)
             elif len(robotsIPs) != 0:
-                robotIP, isValidFrame = self.setupRobots(robotIP, robotsIPs)
+                robotIP, isValidFrame = self.setupRobots(robotIP, robotsIPs, configuredRobots)
             else:
                 if not executed:
                     executed, resultsFrame = self.initializeVideoAndLogging(frameHsv.shape[:2])
@@ -1340,7 +1424,12 @@ class Base(object):
                     print(f"Respuesta de {addr[0]}: {data.decode()}")
                     robotsIPs.add(addr[0])
             except socket.timeout:
-                self.sendInstructionBroadcast(instruction)
+                try:
+                    self.sendInstructionBroadcast(instruction)
+                except OSError as e:
+                    print(f"⚠ Error al reenviar broadcast: {e}")
+                    print("  Verifica la configuración de red e interfaz en configSystem.json")
+                    break
 
         return list(robotsIPs)
 
