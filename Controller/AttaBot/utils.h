@@ -155,7 +155,10 @@ enum RobotState {
     IDENTIFY_OBSTACLE,
     ACTIVE_EVASION,
     REQUEST_POSITION,
-    RESUME_AFTER_EVASION
+    RESUME_AFTER_EVASION,
+    BUG2_SEEK,
+    BUG2_WALL_FOLLOW,
+    BUG2_REQUEST_POSITION
 };
 
 
@@ -280,6 +283,137 @@ struct NavigationTarget {
     }
 };
 
+
+/***************************************************************************************
+ * Estructura: Bug2State
+ * 
+ * Implementa el algoritmo Bug 2 para navegación descentralizada.
+ * El robot alterna entre ir directo al objetivo (GOAL_SEEK) y
+ * rodear obstáculos (WALL_FOLLOW) usando la "Línea M" como
+ * referencia para decidir cuándo puede dejar de seguir la pared.
+ ***************************************************************************************/
+struct Bug2State {
+    // === Sub-estados internos ===
+    enum SubState { IDLE, GOAL_SEEK, WALL_FOLLOW };
+    SubState subState = IDLE;
+    
+    // === Puntos clave del algoritmo ===
+    float startX = 0, startY = 0;     // Punto de inicio de la navegación
+    float goalX = 0, goalY = 0;       // Punto objetivo
+    float hitX = 0, hitY = 0;         // Punto donde chocó con el obstáculo
+    float hitDistanceToGoal = 0;      // Distancia al objetivo desde hitPoint
+    
+    // === Línea M (recta Start -> Goal) ===
+    // Ecuación: A*x + B*y + C = 0
+    float lineA = 0, lineB = 0, lineC = 0;
+    
+    // === Configuración ===
+    bool isActive = false;
+    float arrivalThreshold = 80;          // mm para considerar "llegó"
+    float mLineThreshold = 60;            // mm de tolerancia para cruzar línea M
+    int wallFollowDirection = 1;          // 1 = seguir pared derecha, -1 = izquierda
+    float wallFollowSegment = 120;        // mm por segmento de avance al seguir pared
+    float wallFollowTurnAngle = 45;       // grados por giro al seguir pared
+    
+    // === Detección de loops y timeout ===
+    unsigned long navigationStartTime = 0;
+    const unsigned long maxNavigationTime = 180000;  // 3 minutos máximo
+    float loopCheckX = 0, loopCheckY = 0;            // Posición al entrar a WALL_FOLLOW
+    bool loopCheckSet = false;
+    int wallFollowSteps = 0;                         // Pasos en WALL_FOLLOW
+    const int maxWallFollowSteps = 100;              // Máximo antes de abortar
+    const int minStepsBeforeLoopCheck = 8;           // Mín de pasos antes de verificar loop
+    float loopThreshold = 100;                       // mm, si vuelve al hitPoint = loop
+    
+    // === Métodos ===
+    
+    void Start(float sx, float sy, float gx, float gy) {
+        startX = sx;  startY = sy;
+        goalX = gx;   goalY = gy;
+        isActive = true;
+        subState = GOAL_SEEK;
+        navigationStartTime = millis();
+        wallFollowSteps = 0;
+        loopCheckSet = false;
+        
+        // Calcular coeficientes de la Línea M: Ax + By + C = 0
+        lineA = goalY - startY;
+        lineB = startX - goalX;
+        lineC = goalX * startY - startX * goalY;
+        
+        // Normalizar para que la distancia sea en unidades reales
+        float norm = sqrt(lineA * lineA + lineB * lineB);
+        if (norm > 0.001) {
+            lineA /= norm;
+            lineB /= norm;
+            lineC /= norm;
+        }
+    }
+    
+    void Reset() {
+        isActive = false;
+        subState = IDLE;
+        startX = 0; startY = 0;
+        goalX = 0;  goalY = 0;
+        hitX = 0;   hitY = 0;
+        hitDistanceToGoal = 0;
+        lineA = 0; lineB = 0; lineC = 0;
+        wallFollowSteps = 0;
+        loopCheckSet = false;
+        navigationStartTime = 0;
+    }
+    
+    void RecordHitPoint(float x, float y) {
+        hitX = x;
+        hitY = y;
+        hitDistanceToGoal = CalculateDistance(x, y, goalX, goalY);
+        subState = WALL_FOLLOW;
+        wallFollowSteps = 0;
+        loopCheckX = x;
+        loopCheckY = y;
+        loopCheckSet = true;
+    }
+    
+    // Distancia de un punto a la línea M
+    float DistanceToMLine(float x, float y) {
+        return abs(lineA * x + lineB * y + lineC);
+    }
+    
+    // ¿El robot está sobre la Línea M?
+    bool IsOnMLine(float x, float y) {
+        return DistanceToMLine(x, y) < mLineThreshold;
+    }
+    
+    // ¿El robot está más cerca del objetivo que cuando chocó?
+    bool IsCloserThanHitPoint(float x, float y) {
+        float currentDist = CalculateDistance(x, y, goalX, goalY);
+        return currentDist < (hitDistanceToGoal - arrivalThreshold * 0.5);
+    }
+    
+    // Condición Bug 2 para dejar de seguir pared
+    bool ShouldLeaveWall(float x, float y) {
+        if (wallFollowSteps < minStepsBeforeLoopCheck) return false;
+        return IsOnMLine(x, y) && IsCloserThanHitPoint(x, y);
+    }
+    
+    bool HasReachedGoal(float x, float y) {
+        return CalculateDistance(x, y, goalX, goalY) < arrivalThreshold;
+    }
+    
+    bool HasTimedOut() {
+        return (millis() - navigationStartTime) > maxNavigationTime;
+    }
+    
+    // Detectar si el robot dio una vuelta completa al obstáculo
+    bool HasCompletedLoop(float x, float y) {
+        if (!loopCheckSet || wallFollowSteps < minStepsBeforeLoopCheck) return false;
+        return CalculateDistance(x, y, loopCheckX, loopCheckY) < loopThreshold;
+    }
+    
+    bool HasExceededMaxSteps() {
+        return wallFollowSteps >= maxWallFollowSteps;
+    }
+};
 
 /***************************************************************************************
  * Estructura: InterruptionContext
