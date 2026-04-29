@@ -1,7 +1,6 @@
 #include "utils.h"
 #include <Adafruit_APDS9960.h> // v1.3.0
 #include <ArduinoOTA.h>
-#include <EEPROM.h>
 #include <ESP32Servo.h> // v3.0.9
 #include <FastLED.h>    // v3.10.2
 #include <ICM_20948.h>  // v1.2.12
@@ -15,7 +14,7 @@
 // ============================================================================
 
 // Descomentar solo para debug
-// #define DebugSerial
+#define DebugSerial
 #ifdef DebugSerial
 #define DebugSerialPrint(x) Serial.print(x)
 #define DebugSerialPrintln(x) Serial.println(x)
@@ -129,7 +128,7 @@ const float gravity = 9806.65;
 const float conversionFactor = 8192.0;
 float yaw;
 float imuGravity;
-biasStore store;
+bool imuAvailable = false;  // true solo si setupIMU() completó exitosamente
 
 // LEDs
 int maxBrightness = 140;
@@ -161,6 +160,10 @@ ObstacleState obstacles;
 MovementMetrics movement;
 LedController ledCtrl;
 Bug2State bug2;
+
+// IMU — control de frecuencia de lectura
+unsigned long lastImuRead = 0;
+const unsigned long imuReadInterval = 20;  // ms — 50Hz, por debajo del ODR del DMP (~112Hz)
 
 // Variables de control de movimiento
 unsigned long currentMillis = millis();
@@ -220,7 +223,6 @@ Preferences preferences;
 // Setup y configuración
 void SetupFrontSensor();
 void WiFiStatus();
-void setupIMU();
 void updateMillimetersPerPulse();
 void InitializePPR();
 void SavePPR(float newPPR);
@@ -248,10 +250,20 @@ void SelectMovementRW();
 void InitiateIterativeNavigation(float targetX, float targetY);
 void CalculateIterativeMovement();
 
+// Navegación Bug 2
+void InitiateBug2Navigation(float targetX, float targetY);
+void Bug2ProcessPosition();
+void Bug2WallFollowStep();
+
 // Auxiliares
 std::array<String, 5> SeparateCommand(const String &command, char delimiter);
 bool IsRobotObstacle(float x2, float y2, float angle, int sensors, String id);
 void ReadSerialCommands();
+// Nota: CalculateDistance, NormalizeAngle e InRange están definidas inline en utils.h
+// Se redeclaran aquí para garantizar visibilidad desde este translation unit
+inline float CalculateDistance(float x1, float y1, float x2, float y2);
+inline float CalculateAngleToTarget(float x1, float y1, float x2, float y2);
+inline float NormalizeAngle(float angle);
 
 // LED
 void setLedColor(uint8_t red, uint8_t green, uint8_t blue);
@@ -260,12 +272,32 @@ void setLedBlink(uint8_t red, uint8_t green, uint8_t blue,
                  unsigned long intervalMs);
 
 // IMU
-bool StoreValido(biasStore *store);
+void setupIMU();
+void SaveIMUBias(biasStore* store);
 void LeerYaw();
 
 // ============================================================================
 // INTERRUPCIONES (ISR)
 // ============================================================================
+
+void i2cScan() {
+  Serial.println("\n=== I2C SCAN ===");
+  int found = 0;
+  for (byte addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    byte error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.printf("  Dispositivo en 0x%02X", addr);
+      if (addr == 0x68) Serial.print("  ← IMU (AD0=GND)");
+      if (addr == 0x69) Serial.print("  ← IMU (AD0=VCC)");
+      if (addr == 0x39) Serial.print("  ← APDS9960");
+      Serial.println();
+      found++;
+    }
+  }
+  Serial.printf("  Total: %d dispositivo(s)\n", found);
+  Serial.println("================\n");
+}
 
 void IRAM_ATTR LeftWheelPulses() {
   int MSB = digitalRead(leftEncoderC2);
@@ -343,6 +375,21 @@ void SavePPR(float newPPR) {
   DebugSerialPrintf("PPR guardado permanentemente: %.2f\n", newPPR);
 }
 
+void SaveIMUBias(biasStore* store) {
+  preferences.begin("attabot-config", false);
+  preferences.putInt("bias_gx", store->biasGyroX);
+  preferences.putInt("bias_gy", store->biasGyroY);
+  preferences.putInt("bias_gz", store->biasGyroZ);
+  preferences.putInt("bias_ax", store->biasAccelX);
+  preferences.putInt("bias_ay", store->biasAccelY);
+  preferences.putInt("bias_az", store->biasAccelZ);
+  preferences.putInt("bias_cx", store->biasCPassX);
+  preferences.putInt("bias_cy", store->biasCPassY);
+  preferences.putInt("bias_cz", store->biasCPassZ);
+  preferences.end();
+  DebugSerialPrintln("Bias IMU guardados en Preferences");
+}
+
 void updateMillimetersPerPulse() {
   millimetersPerPulse = wheelCircumference / pulsesPerRev;
 }
@@ -383,6 +430,7 @@ void setup() {
   DebugSerialPrintln("[4] Inicializando I2C...");
   Wire.begin();
   Wire.setClock(400000);
+  i2cScan();
   DebugSerialPrintln("[4] I2C OK");
 
   // IMPORTANTE: setHostname DEBE estar ANTES de WiFi.begin()
@@ -444,10 +492,21 @@ void setup() {
                   DetectRightObstacle, FALLING);
   DebugSerialPrintln("[9] Sensores OK");
 
-  DebugSerialPrintln("\n=== SETUP COMPLETO ===\n");
+  // IMPORTANTE: La IMU debe inicializarse ANTES que el APDS9960.
+  // Invertir este orden rompe silenciosamente la init del ICM-20948 en el bus I2C.
+  DebugSerialPrintln("[10] Inicializando IMU ICM-20948...");
+  setupIMU();
+  if (imuAvailable) {
+    DebugSerialPrintln("[10] IMU OK");
+  } else {
+    DebugSerialPrintln("[10] IMU no disponible — continuando sin IMU");
+  }
 
+  DebugSerialPrintln("[11] Inicializando sensor frontal APDS9960...");
   SetupFrontSensor();
   delay(200);
+
+  DebugSerialPrintln("\n=== SETUP COMPLETO ===\n");
 }
 
 // ============================================================================
@@ -462,6 +521,13 @@ void loop() {
   ReadUdpPackets();
   ReadSensors();
   SetupFrontSensor();
+
+  // Lectura IMU no bloqueante — se ejecuta solo si la IMU está disponible
+  // y han pasado al menos imuReadInterval ms desde la última lectura.
+  if (imuAvailable && (millis() - lastImuRead >= imuReadInterval)) {
+    lastImuRead = millis();
+    LeerYaw();
+  }
 
 #ifdef DebugSerial
   ReadSerialCommands();
@@ -2167,16 +2233,17 @@ void ReadUdpPackets() {
 
   // GET_STATUS
   else if (command == "GET_STATUS") {
-    char buffer[200];
+    char buffer[250];
     snprintf(
         buffer, sizeof(buffer),
         "STATUS|ID:%s|State:%d|NavActive:%d|Evading:%d|Obstacles:%d|Sensors:L%"
-        "d-C%d-R%d|Pos:(%.1f,%.1f,%.1f)|Target:(%.1f,%.1f)|Iter:%d/%d",
+        "d-C%d-R%d|Pos:(%.1f,%.1f,%.1f)|Target:(%.1f,%.1f)|Iter:%d/%d|Yaw:%.1f|IMU:%d",
         robotID.c_str(), state, navTarget.isActive, isEvading,
         obstacles.HasAnyObstacle(), obstacles.leftObstacle,
         obstacles.centralObstacle, obstacles.rightObstacle, robotPose.x,
         robotPose.y, robotPose.angle, navTarget.targetX, navTarget.targetY,
-        navTarget.currentIteration, navTarget.maxIterations);
+        navTarget.currentIteration, navTarget.maxIterations,
+        yaw, (int)imuAvailable);
     SendMessage(robots["Base"], buffer);
   }
 
@@ -2197,6 +2264,15 @@ void ReadUdpPackets() {
     state = STOP;
     MessageDebugf("DEBUG: -1, ID: %s, ✅ Navegación abortada manualmente",
                   robotID.c_str());
+  }
+
+  // GET_YAW — retorna el yaw actual de la IMU para validación en Fase 2
+  // Uso desde la base: BASE.GET_YAW → responde YAW|<valor>|<imuAvailable>
+  else if (command == "GET_YAW") {
+    char buffer[60];
+    snprintf(buffer, sizeof(buffer), "YAW|%.2f|%d|%.3f",
+             yaw, (int)imuAvailable, imuGravity);
+    SendMessage(robots["Base"], buffer);
   }
 }
 
@@ -2359,27 +2435,8 @@ void setLedBlink(uint8_t red, uint8_t green, uint8_t blue,
 }
 
 // ============================================================================
-// FUNCIONES IMU (OPCIONAL)
+// FUNCIONES IMU
 // ============================================================================
-
-bool StoreValido(biasStore *store) {
-  int32_t suma = store->header;
-
-  if (suma != 0x42)
-    return false;
-
-  suma += store->biasGyroX;
-  suma += store->biasGyroY;
-  suma += store->biasGyroZ;
-  suma += store->biasAccelX;
-  suma += store->biasAccelY;
-  suma += store->biasAccelZ;
-  suma += store->biasCPassX;
-  suma += store->biasCPassY;
-  suma += store->biasCPassZ;
-
-  return (store->sum == suma);
-}
 
 void setupIMU() {
   DebugSerialPrintln("Inicializando IMU ICM-20948...");
@@ -2390,8 +2447,7 @@ void setupIMU() {
 
   while (!imuDetected && attempts < maxAttempts) {
     attempts++;
-    DebugSerialPrintf("Intento %d/%d de conexión con IMU...\n", attempts,
-                      maxAttempts);
+    DebugSerialPrintf("Intento %d/%d de conexión con IMU...\n", attempts, maxAttempts);
 
     imu.begin(Wire, AD0_VAL);
 
@@ -2408,13 +2464,10 @@ void setupIMU() {
     DebugSerialPrintln("ERROR CRÍTICO: No se pudo detectar la IMU");
     DebugSerialPrintln("Verifica:");
     DebugSerialPrintln("  1. Conexión física del cable Qwiic");
-    DebugSerialPrintln(
-        "  2. AD0_VAL debe ser 1 (dirección 0x69) o 0 (dirección 0x68)");
-    DebugSerialPrintln(
-        "  3. Que no haya conflictos con otros dispositivos I2C");
-
+    DebugSerialPrintln("  2. AD0_VAL debe ser 1 (0x69) o 0 (0x68)");
+    DebugSerialPrintln("  3. Que no haya conflictos con otros dispositivos I2C");
     ledCtrl.setBlink(255, 0, 0, maxBrightness, 500);
-    return;
+    return;  // imuAvailable permanece false
   }
 
   DebugSerialPrintln("Inicializando DMP...");
@@ -2423,14 +2476,13 @@ void setupIMU() {
   success &= (imu.initializeDMP() == ICM_20948_Stat_Ok);
   if (!success) {
     DebugSerialPrintln("ERROR: Falló initializeDMP()");
+    DebugSerialPrintln("Verifica que ICM_20948_USE_DMP esté definido en ICM_20948_C.h");
     ledCtrl.setBlink(255, 128, 0, maxBrightness, 300);
     return;
   }
 
-  success &= (imu.enableDMPSensor(INV_ICM20948_SENSOR_ROTATION_VECTOR) ==
-              ICM_20948_Stat_Ok);
-  success &= (imu.enableDMPSensor(INV_ICM20948_SENSOR_ACCELEROMETER) ==
-              ICM_20948_Stat_Ok);
+  success &= (imu.enableDMPSensor(INV_ICM20948_SENSOR_ROTATION_VECTOR) == ICM_20948_Stat_Ok);
+  success &= (imu.enableDMPSensor(INV_ICM20948_SENSOR_ACCELEROMETER)   == ICM_20948_Stat_Ok);
 
   if (!success) {
     DebugSerialPrintln("ERROR: Falló habilitando sensores DMP");
@@ -2439,49 +2491,55 @@ void setupIMU() {
 
   success &= (imu.setDMPODRrate(DMP_ODR_Reg_Quat9, 1) == ICM_20948_Stat_Ok);
   success &= (imu.setDMPODRrate(DMP_ODR_Reg_Accel, 1) == ICM_20948_Stat_Ok);
-
-  success &= (imu.enableFIFO() == ICM_20948_Stat_Ok);
-  success &= (imu.enableDMP() == ICM_20948_Stat_Ok);
-  success &= (imu.resetDMP() == ICM_20948_Stat_Ok);
-  success &= (imu.resetFIFO() == ICM_20948_Stat_Ok);
+  success &= (imu.enableFIFO()  == ICM_20948_Stat_Ok);
+  success &= (imu.enableDMP()   == ICM_20948_Stat_Ok);
+  success &= (imu.resetDMP()    == ICM_20948_Stat_Ok);
+  success &= (imu.resetFIFO()   == ICM_20948_Stat_Ok);
 
   if (!success) {
     DebugSerialPrintln("ERROR: Falló configurando FIFO/DMP");
-    DebugSerialPrintln(
-        "Verifica que ICM_20948_USE_DMP esté definido en ICM_20948_C.h");
     ledCtrl.setBlink(0, 255, 0, maxBrightness, 300);
     return;
   }
 
-  if (!EEPROM.begin(128)) {
-    DebugSerialPrintln("ADVERTENCIA: Falló inicializando EEPROM");
-  } else {
-    EEPROM.get(0, store);
+  // --- Restaurar calibración desde Preferences ---
+  biasStore store;
+  preferences.begin("attabot-config", true);  // read-only
+  store.biasGyroX  = preferences.getInt("bias_gx", 0);
+  store.biasGyroY  = preferences.getInt("bias_gy", 0);
+  store.biasGyroZ  = preferences.getInt("bias_gz", 0);
+  store.biasAccelX = preferences.getInt("bias_ax", 0);
+  store.biasAccelY = preferences.getInt("bias_ay", 0);
+  store.biasAccelZ = preferences.getInt("bias_az", 0);
+  store.biasCPassX = preferences.getInt("bias_cx", 0);
+  store.biasCPassY = preferences.getInt("bias_cy", 0);
+  store.biasCPassZ = preferences.getInt("bias_cz", 0);
+  preferences.end();
 
-    if (StoreValido(&store)) {
-      DebugSerialPrintln("Calibración válida encontrada en EEPROM");
+  if (store.IsValid()) {
+    DebugSerialPrintln("Calibración válida encontrada en Preferences");
+    bool calOk = true;
+    calOk &= (imu.setBiasGyroX(store.biasGyroX)   == ICM_20948_Stat_Ok);
+    calOk &= (imu.setBiasGyroY(store.biasGyroY)   == ICM_20948_Stat_Ok);
+    calOk &= (imu.setBiasGyroZ(store.biasGyroZ)   == ICM_20948_Stat_Ok);
+    calOk &= (imu.setBiasAccelX(store.biasAccelX) == ICM_20948_Stat_Ok);
+    calOk &= (imu.setBiasAccelY(store.biasAccelY) == ICM_20948_Stat_Ok);
+    calOk &= (imu.setBiasAccelZ(store.biasAccelZ) == ICM_20948_Stat_Ok);
+    calOk &= (imu.setBiasCPassX(store.biasCPassX) == ICM_20948_Stat_Ok);
+    calOk &= (imu.setBiasCPassY(store.biasCPassY) == ICM_20948_Stat_Ok);
+    calOk &= (imu.setBiasCPassZ(store.biasCPassZ) == ICM_20948_Stat_Ok);
 
-      success &= (imu.setBiasGyroX(store.biasGyroX) == ICM_20948_Stat_Ok);
-      success &= (imu.setBiasGyroY(store.biasGyroY) == ICM_20948_Stat_Ok);
-      success &= (imu.setBiasGyroZ(store.biasGyroZ) == ICM_20948_Stat_Ok);
-      success &= (imu.setBiasAccelX(store.biasAccelX) == ICM_20948_Stat_Ok);
-      success &= (imu.setBiasAccelY(store.biasAccelY) == ICM_20948_Stat_Ok);
-      success &= (imu.setBiasAccelZ(store.biasAccelZ) == ICM_20948_Stat_Ok);
-      success &= (imu.setBiasCPassX(store.biasCPassX) == ICM_20948_Stat_Ok);
-      success &= (imu.setBiasCPassY(store.biasCPassY) == ICM_20948_Stat_Ok);
-      success &= (imu.setBiasCPassZ(store.biasCPassZ) == ICM_20948_Stat_Ok);
-
-      if (success) {
-        DebugSerialPrintln("Calibración restaurada correctamente");
-      } else {
-        DebugSerialPrintln("ADVERTENCIA: Falló al aplicar calibración");
-      }
+    if (calOk) {
+      DebugSerialPrintln("Calibración restaurada correctamente");
     } else {
-      DebugSerialPrintln("ADVERTENCIA: No hay calibración válida en EEPROM");
-      DebugSerialPrintln("La IMU funcionará con valores por defecto");
+      DebugSerialPrintln("ADVERTENCIA: Falló al aplicar calibración");
     }
+  } else {
+    DebugSerialPrintln("ADVERTENCIA: No hay calibración válida en Preferences");
+    DebugSerialPrintln("La IMU funcionará con valores por defecto");
   }
 
+  imuAvailable = true;
   DebugSerialPrintln("IMU inicializada exitosamente");
   ledCtrl.setSolid(0, 255, 0, maxBrightness);
   delay(1000);
@@ -2489,18 +2547,21 @@ void setupIMU() {
 }
 
 void LeerYaw() {
+  if (!imuAvailable) return;
+
   icm_20948_DMP_data_t data;
   imu.readDMPdataFromFIFO(&data);
 
   if ((imu.status != ICM_20948_Stat_Ok) &&
       (imu.status != ICM_20948_Stat_FIFOMoreDataAvail)) {
-    DebugSerialPrintf("Error leyendo FIFO: %d\n", imu.status);
+    if (imu.status != ICM_20948_Stat_FIFONoDataAvail) {
+      DebugSerialPrintf("Error leyendo FIFO: %d\n", imu.status);
+    }
     return;
   }
 
   if ((data.header & DMP_header_bitmap_Quat9) == 0) {
-    DebugSerialPrintln("No hay datos de Quaternion disponibles");
-    return;
+    return;  // Sin datos de quaternion en este ciclo — normal a baja ODR
   }
 
   double q1 = ((double)data.Quat9.Data.Q1) / 1073741824.0;
@@ -2518,9 +2579,8 @@ void LeerYaw() {
     float accX = (float)data.Raw_Accel.Data.X / conversionFactor;
     float accY = (float)data.Raw_Accel.Data.Y / conversionFactor;
     float accZ = (float)data.Raw_Accel.Data.Z / conversionFactor;
-
     imuGravity = sqrt(accX * accX + accY * accY + accZ * accZ);
-    DebugSerialPrintf("Gravedad: %.2f mm/s² (esperado ~9806.65)\n", imuGravity);
+    DebugSerialPrintf("Gravedad: %.3f g\n", imuGravity);
   }
 
   imu.resetFIFO();

@@ -23,21 +23,21 @@ def runOnThread(func):
     def wrapper(*args, **kwargs):
         def executeFunc():
             func(*args, **kwargs)
-        
+
         thread = threading.Thread(target=executeFunc, daemon=True)
         thread.start()
-        
+
         return thread
-    
+
     return wrapper
 
 
 def videoWriter(frameResolution, numRobots, pathVideo, processInterval, queue, debugResolution):
     """
     Graba un video en el disco utilizando los cuadros de video que llegan a través de una cola,
-    mostrando además el video en una ventana .
+    mostrando además el video en una ventana.
 
-    Este proceso lee pares de fotogramas de `queue`, une los fotogramas en uno solo y 
+    Este proceso lee pares de fotogramas de `queue`, une los fotogramas en uno solo y
     los guarda en un archivo AVI con un nombre específico que incluye la cantidad de robots y la fecha y hora actuales.
     También muestra el video en pantalla.
 
@@ -78,304 +78,70 @@ def videoWriter(frameResolution, numRobots, pathVideo, processInterval, queue, d
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-        
+
     video.release()
-      
 
 
-class Color(object):
-    """
-    La clase Color representa un color específico con límites de umbral para segmentación de imágenes,
-    configurando el tamaño de los círculos pequeños y grandes en función de los parámetros de configuración
-    y proporcionando métodos para procesar cuadros de video en busca de estos círculos.
-
-    Parámetros de inicialización:
-    - name (str): Nombre del color (utilizado para ventanas de depuración).
-    - configColor (dict): Configuración de límites de color con 'light' y 'dark' para la segmentación.
-    - configLimits (dict): Límites de configuración para el tamaño de círculos y margen de error.
-    - mmPixel (float): Escala en mm/píxel para calcular el área y posición.
-
-    Atributos:
-    - light (tuple): Límite bajo del color en HSV.
-    - dark (tuple): Límite alto del color en HSV.
-    - contours (dict): Contornos de los círculos encontrados, separados por tipo ('small' y 'big').
-    - contourAreas (dict): Áreas de los contornos encontrados.
-    - centroids (dict): Coordenadas de los centroides de cada contorno.
-    - mask (list): Máscara binaria del color en el cuadro procesado.
-    - processedMask (list): Máscara procesada para la detección de contornos.
-    """
-
-    def __init__(self, name, configColor, configLimits, mmPixel):
-        self.name = name
-        self.nameWindowDebug = f'Debug Color: {self.name}'
-        self.smallCircleMin = int
-        self.smallCircleMax = int
-        self.bigCircleMin = int
-        self.bigCircleMax = int
-        self.smallRadius = int
-        self.bigRadius = int
-        self.mmPixel = mmPixel
-        self.light = []
-        self.dark = []
-        self.contours = {}
-        self.contourAreas = {}
-        self.centroids = {}
-        self.mask = []
-        self.processedMask = []
-        self.initColor(configColor, configLimits)
-
-
-    def initColor(self, configColor, configLimits):
-        """
-        Configura los límites de color y el tamaño de los círculos en base a la configuración.
-
-        Parámetros:
-        - configColor (dict): Configuración de los límites de color.
-        - configLimits (dict): Límites de tamaño de los círculos y margen de error.
-
-        Retorna:
-        None
-        """
-        self.light = tuple(configColor['light'])
-        self.dark = tuple(configColor['dark'])
-
-        self.bigRadius = configLimits['big_circle']
-        self.smallRadius = configLimits['small_circle']
-        marginFactor = float(configLimits['margin_percentage']) / 100
-
-        smallArea = math.pi * pow(self.smallRadius, 2)
-        bigArea = math.pi * pow(self.bigRadius, 2)
-
-        self.smallCircleMin = int(smallArea * (1 - marginFactor))
-        self.smallCircleMax = int(smallArea * (1 + marginFactor))
-        self.bigCircleMin = int(bigArea * (1 - marginFactor))
-        self.bigCircleMax = int(bigArea * (1 + marginFactor))
-    
-
-    def contourFilter(self, contoursRaw):
-        """
-        Filtra contornos basándose en su área y clasifica los contornos como 'small' o 'big' 
-        según las áreas configuradas para círculos pequeños y grandes.
-        Cada contorno se ajusta mediante convexHull para mejorar su precisión.
-
-        Parámetros:
-        - contoursRaw (list): Lista de contornos en bruto obtenidos de una imagen.
-
-        Retorna:
-        - contours (dict): Diccionario con los contornos filtrados, clasificados en 'small' y 'big'.
-        - contourAreas (dict): Diccionario con las áreas de cada contorno en 'small' y 'big'.
-        """
-        contours = {'small': [], 'big': []}
-        contourAreas = {'small': [], 'big': []}
-
-        smallMin, smallMax = self.smallCircleMin, self.smallCircleMax
-        bigMin, bigMax = self.bigCircleMin, self.bigCircleMax
-
-        for contour in contoursRaw:
-            contour = cv2.convexHull(contour)
-            area = int(cv2.contourArea(contour) * (pow(self.mmPixel, 2)))
-
-            if smallMin <= area <= smallMax:
-                contours['small'].append(contour)
-                contourAreas['small'].append(area)
-            elif bigMin <= area <= bigMax:
-                contours['big'].append(contour)
-                contourAreas['big'].append(area)
-
-        return contours, contourAreas
-
-
-    def centroidsContours(self):
-        """
-        Calcula los centroides de los contornos almacenados y los clasifica en dos categorías: 
-        'small' y 'big' en función de sus áreas.
-
-        Retorna:
-        - centroids (dict): Diccionario con los centroides de los contornos clasificados como 
-        'small' y 'big', en formato (cx, cy), donde cx y cy son las coordenadas en milímetros 
-        ajustadas con el factor mmPixel.
-        """
-        centroids = {'small': [], 'big': []}
-        for circleType, contourList in self.contours.items():
-            for contour in contourList:
-                moments = cv2.moments(contour)
-                # Calcula el centroide
-                # https://docs.opencv.org/3.4/dd/d49/tutorial_py_contour_features.html
-                cx = round((moments['m10'] / moments['m00']) * self.mmPixel, 1)
-                cy = round((moments['m01'] / moments['m00']) * self.mmPixel, 1)
-                centroids[circleType].append((cx, cy))
-
-        return centroids
-
-
-    def processFrame(self, frame):
-        """
-        Procesa un frame de video para detectar áreas que caen dentro de los límites de color especificados.
-
-        Parámetros:
-        - frame (numpy.ndarray): Un frame de imagen en formato HSV que se procesará para 
-        detectar los colores definidos por los atributos 'light' y 'dark' de la clase.
-
-        Este método realiza las siguientes operaciones:
-        1. Crea una máscara binaria que destaca los píxeles dentro del rango de color especificado.
-        2. Aplica una transformación morfológica de apertura para reducir el ruido y mejorar 
-        la uniformidad de los contornos detectados.
-        3. Utiliza un filtro de mediana para suavizar la máscara procesada.
-        4. Dilata la máscara procesada para aumentar el tamaño de las regiones detectadas.
-        5. Busca los contornos en la máscara procesada y los clasifica utilizando el método 
-        `contourFilter`, además de calcular los centroides con `centroidsContours`.
-        """
-        self.mask = cv2.inRange(frame, self.light, self.dark)
-
-        # Se utiliza una transformación morfológica de dilatación de la imagen para hacer los contornos más uniformes
-        # Se crea el kernel, entre mayor sea más "grosera" es la dilatación
-        kernel = np.ones((4, 4),np.uint8)
-        processedMask = cv2.morphologyEx(self.mask, cv2.MORPH_OPEN, kernel)
-        processedMask = cv2.medianBlur(processedMask, 5)
-        self.processedMask = cv2.dilate(processedMask, kernel, iterations=1)
-
-        # Busca los contornos en cada una de las imágenes filtradas
-        # Se aproximan por medio de una compresión horizontal, vertical y diagonal
-        # https://docs.opencv.org/master/d3/dc0/group__imgproc__shape.html#gadf1ad6a0b82947fa1fe3c3d497f260e0
-        contours, _ = cv2.findContours(self.processedMask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-
-        self.contours, self.contourAreas = self.contourFilter(contours)
-        self.centroids = self.centroidsContours()
-
-
-    def debug(self):
-        """
-        Muestra una ventana de depuración con las máscaras y contornos procesados.
-
-        No se requieren parámetros y no se devuelve ningún valor. La función se utiliza para visualizar los resultados de 
-        la detección de contornos y centroids, facilitando la depuración del procesamiento de imágenes.
-        """
-        mask = cv2.cvtColor(self.mask, cv2.COLOR_GRAY2BGR)
-        processedMask = cv2.cvtColor(self.processedMask, cv2.COLOR_GRAY2BGR)
-
-        borderSize = 4
-        mask = cv2.copyMakeBorder(mask, borderSize, borderSize, borderSize, borderSize, cv2.BORDER_CONSTANT, value=(0, 0, 255))
-        processedMask = cv2.copyMakeBorder(processedMask, borderSize, borderSize, borderSize, borderSize, cv2.BORDER_CONSTANT, value=(0, 0, 255))
-
-        for circleType, contourList in self.contours.items(): 
-            for i, contour in enumerate(contourList):
-                cv2.drawContours(processedMask, [contour], 0, (255, 0, 0), 2)
-                x = int(self.centroids[circleType][i][0] / self.mmPixel)
-                y = int(self.centroids[circleType][i][1] / self.mmPixel)
-                cv2.circle(processedMask, (x, y), 1, (0, 0, 255), 6)
-
-                mmX = round(x * self.mmPixel)
-                mmY = round(y * self.mmPixel)
-                
-                text1 = f'[{mmX},{mmY}]'
-                text2 = f'Area[mm^2]: {self.contourAreas[circleType][i]}'
-                radius = int(self.bigRadius / self.mmPixel * 2.2)
-                position1 = (x - radius  , y + radius)
-                position2 = (x - radius, y + radius + 40)
-                cv2.putText(processedMask, text1, position1, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 1, cv2.LINE_AA)
-                cv2.putText(processedMask, text2, position2, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 1, cv2.LINE_AA)
-
-        mask = cv2.resize(mask, base.debugResolution, interpolation=cv2.INTER_AREA)
-        processedMask = cv2.resize(processedMask, base.debugResolution, interpolation=cv2.INTER_AREA)
-        debug = cv2.vconcat([mask, processedMask])
-        cv2.imshow(self.nameWindowDebug, debug)
-
+# =============================================================================
+# CLASE COLOR ELIMINADA
+# El sistema de detección por círculos de color HSV fue reemplazado por
+# detección de ArUco markers. La identificación del robot se realiza
+# directamente por el ID del marker, eliminando la necesidad de segmentación
+# por color y el cálculo de centroides.
+# =============================================================================
 
 
 class Robot(object):
     """
     Clase que representa un robot en un sistema de enjambre.
 
+    La detección de pose se realiza mediante ArUco markers.
+    El ID del marker ArUco corresponde directamente al ID del robot.
+
     Atributos:
-        id (int): Identificador único del robot.
+        id (str): Identificador único del robot (igual al ID del marker ArUco).
         name (str): Nombre del robot.
-        colors (list): Lista de colores asociados al robot.
         IP (str): Dirección IP del robot para la comunicación.
-        previousPose (list): Última posición conocida del robot en formato [x, y, a].
+        previousPose (tuple): Última posición conocida del robot en formato (x, y, angle).
     """
 
     def __init__(self, id, configRobot):
         self.id = id
         self.name = ''
-        self.colors = []
         self.IP = ''
-        self.previousPose = []
+        self.previousPose = (-1, -1, -1)
         self.initRobot(configRobot)
-
-
-    def getAngle(self, smallCircle, bigCircle):
-        """
-        Calcula el ángulo entre los centros de dos círculos (grande y pequeño)
-        respecto a la horizontal.
-
-        El ángulo se calcula en grados, tomando como referencia la línea que se forma
-        entre los dos círculos, donde los ángulos positivos se consideran en sentido horario.
-
-        Args:
-            smallCircle (tuple): Coordenadas (x, y) del círculo pequeño.
-            bigCircle (tuple): Coordenadas (x, y) del círculo grande.
-
-        Returns:
-            float: El ángulo en grados entre la línea que se forma entre el círculo grande
-                y el pequeño, en relación a la horizontal.
-        """
-        x1, y1 = bigCircle
-        x2, y2 = smallCircle
-
-        # Calculo de cita respecto a la horizontal, tomando ángulos positivos en sentido horario
-        angle = round(float(np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 360), 1)
-            
-        return angle
 
 
     def getPose(self):
         """
-        Obtiene la pose actual del robot utilizando las posiciones de los círculos
-        grande y pequeño.
+        Obtiene la pose actual del robot desde el diccionario de detecciones ArUco.
 
-        Se busca el círculo grande y se compara con todos los círculos pequeños.
-        Si la distancia entre un círculo grande y un pequeño está dentro de un umbral
-        definido, se calcula la posición (x, y) y el ángulo (a) del robot.
+        El ID del marker ArUco coincide con el ID del robot, por lo que la
+        identificación es directa sin necesidad de comparar colores ni distancias.
 
         Returns:
-            tuple: Un tuple que contiene la posición (x, y) y el ángulo (a) del robot.
-                Si no se encuentra una pose válida, devuelve (-1, -1, -1).
+            tuple: (x_mm, y_mm, angle_deg) si el robot es visible, (-1, -1, -1) si no.
         """
-        bigCircles = base.frameColors[self.colors[0]].centroids['big']
-        smallCircles = base.frameColors[self.colors[1]].centroids['small']
-
-        for bigCircle in bigCircles:
-            for smallCircle in smallCircles:
-                distance = math.dist(bigCircle, smallCircle)
-                if distance <= base.mmCenterDistance:
-                    x, y = bigCircle
-                    a = self.getAngle(smallCircle, bigCircle)
-    
-                    return (x, y, a)
+        if self.id in base.currentArucoDetections:
+            return base.currentArucoDetections[self.id]
         return (-1, -1, -1)
 
 
     def initRobot(self, configRobot):
         """
-        Inicializa el robot configurando su nombre y colores, y establece
-        su pose inicial.
-
-        Este método toma un diccionario de configuración del robot y asigna
-        el nombre y los colores del robot según su ID. Luego, obtiene y
-        guarda la pose actual del robot.
+        Inicializa el robot configurando su nombre y establece su pose inicial.
 
         Args:
-            configRobot (dict): Un diccionario que contiene la configuración
-                                de los robots.
+            configRobot (dict): Diccionario de configuración de los robots.
         """
         self.name = configRobot[self.id]['name']
-        self.colors = configRobot[self.id]['colors']
         self.previousPose = self.getPose()
 
 
     def getDisplacement(self):
         """
-        Calcula el desplazamiento lineal y angular del robot en función de su 
+        Calcula el desplazamiento lineal y angular del robot en función de su
         pose actual y anterior.
 
         Este método obtiene la pose actual del robot y si es válida, calcula
@@ -383,8 +149,8 @@ class Robot(object):
         lineal y angular si estas diferencias superan un umbral definido.
 
         Returns:
-            tuple or None: Un tuple que contiene el desplazamiento lineal y 
-                            angular en milímetros y grados respectivamente, 
+            tuple or None: Un tuple que contiene el desplazamiento lineal y
+                            angular en milímetros y grados respectivamente,
                             o None si la pose actual no es válida o si los
                             desplazamientos son menores al umbral.
 
@@ -396,17 +162,17 @@ class Robot(object):
         currentPose = self.getPose()
         if currentPose == (-1, -1, -1):
             return None
-            
+
         x1, y1, a1 = self.previousPose
         x2, y2, a2 = currentPose
 
-        linearDisplacement = self.linearDisplacement(x1, y1, a1, x2, y2)
-        angularDisplacement = self.angularDisplacement(a1, a2)
+        linearDisp = self.linearDisplacement(x1, y1, a1, x2, y2)
+        angularDisp = self.angularDisplacement(a1, a2)
 
-        if abs(angularDisplacement) >= 4 or abs(linearDisplacement) >= 4:
+        if abs(angularDisp) >= 4 or abs(linearDisp) >= 4:
             self.previousPose = currentPose
-            return linearDisplacement, angularDisplacement
-        
+            return linearDisp, angularDisp
+
         return None
 
 
@@ -414,9 +180,7 @@ class Robot(object):
         """
         Calcula el desplazamiento angular entre dos ángulos.
 
-        Este método determina la diferencia angular entre dos ángulos dados, 
-        asegurándose de que el resultado se mantenga en el rango de -180 a 180 
-        grados. Esto permite interpretar correctamente la dirección de rotación.
+        Asegura que el resultado se mantenga en el rango de -180 a 180 grados.
 
         Args:
             a1 (float): El ángulo inicial en grados.
@@ -424,9 +188,6 @@ class Robot(object):
 
         Returns:
             float: El desplazamiento angular en grados, redondeado a un decimal.
-                Un valor positivo indica un desplazamiento en sentido horario,
-                mientras que un valor negativo indica un desplazamiento en sentido 
-                antihorario.
         """
         angularDisplacement = a2 - a1
         if angularDisplacement > 180:
@@ -439,32 +200,24 @@ class Robot(object):
 
     def linearDisplacement(self, x1, y1, a1, x2, y2):
         """
-        Calcula el desplazamiento lineal entre dos posiciones dadas, 
+        Calcula el desplazamiento lineal entre dos posiciones dadas,
         teniendo en cuenta la dirección del ángulo de la primera posición.
-
-        Este método utiliza el ángulo de la primera posición para determinar si el 
-        desplazamiento es en la misma dirección que el ángulo o en la dirección opuesta. 
-        Si el desplazamiento es en la dirección opuesta, se devuelve un valor negativo.
 
         Args:
             x1 (float): Coordenada x de la primera posición.
             y1 (float): Coordenada y de la primera posición.
-            a1 (float): Ángulo en grados de la primera posición, donde 0 grados 
-                        representa la dirección positiva del eje x.
+            a1 (float): Ángulo en grados de la primera posición.
             x2 (float): Coordenada x de la segunda posición.
             y2 (float): Coordenada y de la segunda posición.
 
         Returns:
-            float: El desplazamiento lineal entre las dos posiciones, redondeado a 
-                un decimal. Un valor positivo indica un desplazamiento en la 
-                dirección del ángulo, mientras que un valor negativo indica un 
-                desplazamiento en la dirección opuesta.
+            float: El desplazamiento lineal entre las dos posiciones, redondeado a
+                un decimal. Positivo = misma dirección que el ángulo.
         """
         a1Rad = math.radians(a1)
         dx = x2 - x1
         dy = y2 - y1
 
-        # Producto escalar entre el desplazamiento y el ángulo
         dotProduct = dx * math.cos(a1Rad) + dy * math.sin(a1Rad)
         displacement = round(math.dist((x1, y1), (x2, y2)), 1)
 
@@ -473,18 +226,10 @@ class Robot(object):
 
     def setupIP(self, ip):
         """
-        Configura la dirección IP del robot y envía una instrucción de configuración 
-        al robot.
-
-        Este método asigna la dirección IP proporcionada a la instancia del robot 
-        y envía un comando de configuración al robot.
+        Configura la dirección IP del robot y envía una instrucción de configuración.
 
         Args:
-            ip (str): La dirección IP que se asignará al robot. Debe estar en formato 
-                    de dirección IPv4 (ej. '192.168.1.1').
-        
-        Returns:
-            None
+            ip (str): La dirección IP que se asignará al robot.
         """
         self.IP = ip
         base.sendInstruction(ip, [f'CONFIG|{self.id}'], False)
@@ -493,54 +238,31 @@ class Robot(object):
 
 class Base(object):
     """
-    Clase Base para la gestión de un sistema de robots de enjambre.
+    Clase Base para la gestión de un sistema de robots de enjambre con detección ArUco.
 
-    Esta clase encapsula la configuración y las funcionalidades necesarias para la 
-    operación de un sistema de visión y control de robots. Proporciona métodos 
-    para la configuración de la cámara, la comunicación a través de UDP, y el 
-    procesamiento de imágenes y colores.
+    El sistema de visión utiliza markers ArUco (DICT_4X4_50) para identificar y
+    localizar los robots. Cada robot lleva un marker cuyo ID corresponde al ID del robot.
+    La pose (x, y, ángulo) se calcula con solvePnP a partir de las esquinas detectadas.
 
-    Atributos:
-        frameColors (dict): Diccionario que almacena los colores de los frame detectados.
-        robots (dict): Diccionario que contiene la configuración y estado de los robots.
-        robotsConfig (dict): Configuración de los robots leída desde un archivo.
-        numRobots (int): Número de robots en el sistema.
-        debug (bool): Indica si el modo de depuración está habilitado.
-        camera (cv2.VideoCapture): Objeto de captura de video para la cámara.
-        debugResolution (tuple): Resolución para la visualización de depuración.
-        mmPixel (float): Escala de milímetros por píxel para la conversión de unidades.
-        mmCenterDistance (int): Distancia en milímetros entre los centros de los círculos.
-        bigCircleRadius (int): Radio del círculo grande utilizado en el procesamiento de imágenes.
-        processInterval (float): Intervalo de procesamiento entre frames.
-        startTime (float): Tiempo de inicio de la prueba.
-        cameraMatriz (list): Matriz de calibración de la cámara.
-        distance (list): Distancia utilizada para la calibración de la cámara.
-        sock (socket.socket): Socket UDP para la comunicación.
-        baseIP (str): Dirección IP de la base.
-        broadcastIP (str): Dirección IP de broadcast para la comunicación UDP.
-        port (int): Puerto para la comunicación UDP.
-        threadInputAlive (bool): Indica si el hilo de entrada está activo.
-        pathVideo (str): Ruta para guardar el videos de la prueba.
-        pathPositionLogs (str): Ruta para guardar los registros de posición.
-        pathConsolelog (str): Ruta para guardar los registros de consola.
-        cameraResolution (list): Resolución de la cámara.
-        newCameraMatriz (np.ndarray): Nueva matriz de cámara optimizada.
-        roi (tuple): Región de interés para la corrección de la cámara.
-        frameQueue (multiprocessing.Queue): Cola para manejar los frames procesados.
-        videoProcess (multiprocessing.Process): Proceso para la grabación de video.
+    Atributos principales:
+        arucoDetector: Detector de markers ArUco inicializado con DICT_4X4_50.
+        markerSizeMm (float): Tamaño físico del marker en mm (configurado en JSON).
+        currentArucoDetections (dict): {robot_id (str): (x_mm, y_mm, angle_deg)}
+            Actualizado en cada frame procesado. Accedido por Robot.getPose().
+        robots (dict): Diccionario {id: Robot} de robots activos.
+        [resto de atributos igual que antes]
     """
 
     def __init__(self):
-        self.frameColors = {}
         self.robots = {}
         self.robotsConfig = {}
         self.numRobots = int
         self.debug = False
         self.camera = None
+        self.cameraIndex = None
+        self.cameraBackend = None
         self.debugResolution = tuple
         self.mmPixel = float
-        self.mmCenterDistance = int
-        self.bigCircleRadius = int
         self.processInterval = float
         self.startTime = float
         self.cameraMatriz = []
@@ -559,372 +281,191 @@ class Base(object):
         self.frameQueue = None
         self.videoProcess = multiprocessing.Process()
         self.congregationActive = False
-        self.leaderID = None 
-        self.robotPositions = {} 
+        self.leaderID = None
+        self.robotPositions = {}
+        # --- ArUco ---
+        self.arucoDetector = None
+        self.markerSizeMm = 80.0          # valor por defecto, sobreescrito desde JSON
+        self.currentArucoDetections = {}  # {robot_id: (x_mm, y_mm, angle_deg)}
+        self.bigCircleRadius = 10         # radio visual en el resultsFrame (px)
 
 
-    def searchRobotsColor(self, robots):
+    # =========================================================================
+    # DETECCIÓN ARUCO
+    # =========================================================================
+
+    def detectArucoMarkers(self, frame):
         """
-        Busca robots según sus colores asociados.
+        Detecta ArUco markers en el frame BGR y retorna poses en mm y grados.
 
-        Este método itera a través de un diccionario de robots, cada uno con identificadores y datos de color. 
-        Para cada robot, se recuperan los centroides de los círculos de color grandes y pequeños asociados, 
-        y luego se calcula la distancia entre cada par de círculos grandes y pequeños. Si la distancia está 
-        dentro del umbral definido (`mmCenterDistance`), el identificador del robot se añade al conjunto 
-        `foundRobots`, y los colores asociados se añaden al conjunto `foundColors`.
+        Reemplaza completamente el sistema de detección por círculos de color.
+        Usa solvePnP con SOLVEPNP_IPPE_SQUARE para obtener posición 3D y orientación
+        de cada marker visible. Las coordenadas se expresan en el plano de la cámara:
+            - X positivo: derecha
+            - Y positivo: abajo
+            - El ángulo es el heading del robot en el plano XY (0° = derecha, CW positivo)
 
         Parámetros:
-        robots (dict): Un diccionario donde las claves son identificadores de robots y los valores son 
-                        diccionarios que contienen información de los colores del robot.
+        - frame (ndarray): Frame BGR de la cámara ya corregido por distorsión.
 
         Retorna:
-        tuple: Una tupla que contiene:
-            - foundRobots (set): Un conjunto de identificadores de robots que se han encontrado dentro del umbral de distancia.
-            - foundColors (set): Un conjunto de colores asociados con los robots encontrados.
+        - dict: {marker_id (str): (x_mm, y_mm, angle_deg)}
+                Los IDs son strings para compatibilidad con el resto del sistema.
+                Retorna {} si no se detecta ningún marker.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self.arucoDetector.detectMarkers(gray)
+
+        detectedPoses = {}
+
+        if ids is None:
+            return detectedPoses
+
+        # Puntos 3D del marker en coordenadas locales (metros)
+        # Orden: top-left, top-right, bottom-right, bottom-left
+        halfSize = (self.markerSizeMm / 1000.0) / 2.0
+        objectPoints = np.array([
+            [-halfSize,  halfSize, 0.0],
+            [ halfSize,  halfSize, 0.0],
+            [ halfSize, -halfSize, 0.0],
+            [-halfSize, -halfSize, 0.0]
+        ], dtype=np.float32)
+
+        for i, marker_id in enumerate(ids.flatten()):
+            imagePoints = corners[i][0].astype(np.float32)
+
+            success, rvec, tvec = cv2.solvePnP(
+                objectPoints,
+                imagePoints,
+                self.cameraMatriz,
+                self.distance,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+
+            if not success:
+                continue
+
+            # Posición en mm (tvec está en metros)
+            x_mm = round(float(tvec[0][0]) * 1000.0, 1)
+            y_mm = round(float(tvec[1][0]) * 1000.0, 1)
+
+            # Ángulo: extraer heading del eje X del marker proyectado en el plano XY
+            rotMatrix, _ = cv2.Rodrigues(rvec)
+            angle_rad = np.arctan2(rotMatrix[1][0], rotMatrix[0][0])
+            angle_deg = round(float(np.degrees(angle_rad) % 360), 1)
+
+            detectedPoses[str(marker_id)] = (x_mm, y_mm, angle_deg)
+
+        return detectedPoses
+
+
+    def drawArucoDebug(self, frame):
+        """
+        Dibuja los markers detectados sobre el frame para depuración visual.
+
+        Muestra los ejes de coordenadas de cada marker y su ID.
+        Solo se llama cuando self.debug está activado.
+
+        Parámetros:
+        - frame (ndarray): Frame BGR donde dibujar las anotaciones.
+
+        Retorna:
+        - ndarray: Frame anotado.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = self.arucoDetector.detectMarkers(gray)
+
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+
+            halfSize = (self.markerSizeMm / 1000.0) / 2.0
+            objectPoints = np.array([
+                [-halfSize,  halfSize, 0.0],
+                [ halfSize,  halfSize, 0.0],
+                [ halfSize, -halfSize, 0.0],
+                [-halfSize, -halfSize, 0.0]
+            ], dtype=np.float32)
+
+            for i, marker_id in enumerate(ids.flatten()):
+                imagePoints = corners[i][0].astype(np.float32)
+                success, rvec, tvec = cv2.solvePnP(
+                    objectPoints, imagePoints,
+                    self.cameraMatriz, self.distance,
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE
+                )
+                if success:
+                    cv2.drawFrameAxes(frame, self.cameraMatriz, self.distance,
+                                      rvec, tvec, self.markerSizeMm / 1000.0 * 0.5)
+
+                    # Texto con pose encima del marker
+                    cx = int(np.mean(corners[i][0][:, 0]))
+                    cy = int(np.mean(corners[i][0][:, 1]))
+                    if str(marker_id) in self.currentArucoDetections:
+                        x_mm, y_mm, ang = self.currentArucoDetections[str(marker_id)]
+                        label = f'ID:{marker_id} ({x_mm},{y_mm}) {ang}deg'
+                        cv2.putText(frame, label, (cx - 60, cy - 15),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 100), 1, cv2.LINE_AA)
+
+        return frame
+
+
+    # =========================================================================
+    # BÚSQUEDA Y SETUP DE ROBOTS
+    # =========================================================================
+
+    def searchRobotsAruco(self, robots):
+        """
+        Detecta qué robots están visibles en el frame actual por su marker ArUco.
+
+        Reemplaza searchRobotsColor. Con ArUco el ID del marker es directamente el
+        ID del robot, por lo que no se necesita correlación de colores ni distancias.
+
+        Parámetros:
+        - robots (dict): Configuración de robots desde el JSON.
+
+        Retorna:
+        - foundRobots (set): IDs (str) de robots detectados visualmente.
+        - foundColors (set): Set vacío — mantenido por compatibilidad con processFoundRobots.
         """
         foundRobots = set()
-        foundColors = set()
 
-        for identifier, data in robots.items():
-            colors = data['colors']
-            bigCircles = self.frameColors[colors[0]].centroids['big']
-            smallCircles = self.frameColors[colors[1]].centroids['small']
+        for robotId in robots.keys():
+            if robotId in self.currentArucoDetections:
+                foundRobots.add(robotId)
 
-            for bigCircle in bigCircles:
-                for smallCircle in smallCircles:
-                    distance = math.dist(bigCircle, smallCircle)
-                    if distance <= self.mmCenterDistance:
-                        foundRobots.add(identifier)
-                        foundColors.update(colors)
-                        break
-        
-        return foundRobots, foundColors
+        return foundRobots, set()
 
 
-    def readConfigFile(self, filePath):
+    def processFoundRobots(self, foundRobots):
         """
-        Lee un archivo de configuración y aplica las configuraciones del sistema.
+        Crea instancias de Robot para cada robot encontrado y los ordena por ID.
 
-        Este método abre un archivo de configuración en formato JSON, carga su contenido y aplica 
-        las configuraciones necesarias para el sistema de visión, comunicación UDP y configuraciones 
-        generales. Además, inicializa la configuración de los robots y los colores asociados.
+        Versión simplificada para ArUco: ya no necesita eliminar colores no usados
+        porque no existe el diccionario frameColors.
 
         Parámetros:
-        filePath (str): La ruta del archivo de configuración que se debe leer.
-
-        Excepciones:
-        Raises:
-            FileNotFoundError: Si el archivo especificado no se encuentra.
-            json.JSONDecodeError: Si el archivo no se puede decodificar como JSON.
-        """
-        with open(filePath, 'r') as file:
-            configuration = json.load(file)
-
-        self.configVisionSystem(configuration['vision_system'])
-        self.configUdp(configuration['udp_communication'])
-        self.generalConfig(configuration['general'])
-
-        self.robotsConfig = configuration['robots']
-        config = configuration['vision_system']['circles_radius']
-        self.frameColors = {color: Color(color, configColor, config, self.mmPixel) for color, configColor in configuration['colors'].items()}
-
-
-    def generalConfig(self, configuration):
-        """
-        Configura las opciones generales del sistema a partir de un diccionario de configuración.
-
-        Este método permite habilitar el modo de depuración y establece las rutas para guardar videos, 
-        registros de posición y registros de consola. Si alguna de las rutas especificadas no existe, 
-        se intenta crear. En caso de que ocurra un error al crear las rutas, se lanza una excepción 
-        con un mensaje de error detallado.
-
-        Parámetros:
-        configuration (dict): Un diccionario que contiene la configuración del sistema. Debe incluir las claves:
-            - 'debug_enable' (bool): Indica si se debe habilitar el modo de depuración.
-            - 'path_save_videos' (str): Ruta donde se guardarán los videos.
-            - 'path_save_position_logs' (str): Ruta donde se guardarán los registros de posición.
-            - 'path_save_console_logs' (str): Ruta donde se guardarán los registros de la consola.
-
-        Excepciones:
-        Raises:
-            Exception: Si ocurre un error al intentar crear una ruta que no existe.
-        """
-        self.debug = configuration['debug_enable']
-
-        self.pathVideo = configuration['path_save_videos']
-        self.pathPositionLogs = configuration['path_save_position_logs']
-        self.pathConsolelog = configuration['path_save_console_logs']
-        for path in [self.pathVideo, self.pathPositionLogs, self.pathConsolelog]:
-            if not os.path.exists(path):
-                print(f"La ruta {path} no existe.")
-                try:
-                    os.makedirs(path)
-                    print(f"Se ha creado la ruta {path}.")
-                except Exception as e:
-                    raise Exception(f"Error al crear la ruta: {e}")
-
-
-    def configUdp(self, configuration):
-        """
-        Configura la comunicación UDP para el sistema.
-
-        Este método establece la dirección IP base, la dirección IP de broadcast y el puerto
-        para la comunicación UDP, ademas, crea un socket UDP. También habilita la opción de
-        broadcast en el socket.
-
-        Parámetros:
-        configuration (dict): Un diccionario que contiene la configuración de UDP,
-                            que incluye:
-            - 'base_ip' (str): La dirección IP base del sistema.
-            - 'broadcast_ip' (str): La dirección IP de broadcast.
-            - 'port' (int): El puerto a utilizar para la comunicación UDP.
-            - 'network_interface' (str, opcional): Nombre de la interfaz de red a usar
-                                                   (ej: 'enp3s0', 'eth0', 'wlan0').
-        """
-        self.baseIP = configuration['base_ip']
-        self.broadcastIP =  configuration['broadcast_ip']
-        self.port = configuration['port']
-        self.networkInterface = configuration.get('network_interface', None)
-
-        # Crear socket UDP
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-        # En Linux, agregar SO_REUSEPORT para mejor manejo de puerto
-        if platform.system() == 'Linux':
-            try:
-                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-                print('✓ SO_REUSEPORT habilitado (Linux)')
-            except AttributeError:
-                # Versiones antiguas de Python pueden no tener SO_REUSEPORT
-                print('⚠ SO_REUSEPORT no disponible en esta versión de Python')
-
-            # Vincular socket a la interfaz de red específica para evitar conflictos
-            # con otras interfaces activas (WiFi, Docker, etc.)
-            if self.networkInterface:
-                try:
-                    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
-                                       self.networkInterface.encode())
-                    print(f'✓ Socket vinculado a interfaz {self.networkInterface}')
-                except (AttributeError, OSError) as e:
-                    print(f'⚠ No se pudo vincular a interfaz {self.networkInterface}: {e}')
-                    print('  El socket usará el enrutamiento por defecto del sistema')
-
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**20)
-
-        try:
-            self.sock.bind((self.baseIP, self.port))
-            print(f'✓ Socket UDP bind exitoso en {self.baseIP}:{self.port}')
-        except OSError as e:
-            print(f'Error al hacer bind en {self.baseIP}:{self.port}')
-            print(f'Motivo: {e}')
-            print('\nSoluciones posibles:')
-            print('  1. Verifica que la IP sea correcta para tu interfaz de red')
-            print(f'  2. Prueba con bind en "0.0.0.0" para escuchar en todas las interfaces')
-            print(f'  3. Asegúrate de que el puerto {self.port} no esté en uso')
-            print('  4. Ejecuta: sudo netstat -tulpn | grep {}'.format(self.port))
-            raise
-
-
-
-    def configVisionSystem(self, configuration):
-        """
-        Configura el sistema de visión de la cámara.
-
-        Este método establece la configuración de la cámara, carga las matrices de calibración, 
-        calcula la nueva matriz de cámara óptima y define la resolución espacial de la imagen 
-        en milímetros por píxel. También se configuran los parámetros relacionados con el 
-        procesamiento de imágenes y el radio de los círculos grandes.
-
-        Parámetros:
-        configuration (dict): Un diccionario que contiene la configuración del sistema de 
-                            visión, que incluye:
-            - 'path_cameraMatrix' (str): La ruta al archivo que contiene la matriz de la cámara.
-            - 'path_distance' (str): La ruta al archivo que contiene la distancia de calibración.
-            - 'mmPixel' (str): La resolución espacial en mm/píxel, en formato 'numerador/denominador'.
-            - 'distance_between_centers' (float): La distancia entre los centros de los círculos.
-            - 'frame_processing_interval' (float): El intervalo de procesamiento de los fotogramas.
-            - 'circles_radius' (dict): Un diccionario que contiene el radio de los círculos.
-        """
-        self.setCamera(configuration)
-
-        # Carga los matrices de calibración
-        self.cameraMatriz = np.loadtxt(configuration['path_cameraMatrix'], dtype=float)
-        self.distance = np.loadtxt(configuration['path_distance'], dtype=float)
-        h, w = self.cameraResolution
-        self.newCameraMatriz, self.roi = cv2.getOptimalNewCameraMatrix(self.cameraMatriz, self.distance, (w,h), 1, (w,h))
-
-        # Resolución espacial para imagen [mm/pixel]
-        numerator, denominator = map(int, configuration['mmPixel'].split('/'))
-        self.mmPixel = numerator / denominator
-        self.mmCenterDistance = configuration['distance_between_centers']
-        self.processInterval = configuration['frame_processing_interval']
-        self.bigCircleRadius = int(configuration['circles_radius']['big_circle'] / self.mmPixel)
-
-
-    def setCamera(self, configuration):
-        """
-        Inicializa la captura de video desde la cámara.
-
-        Este método configura la cámara utilizando OpenCV, estableciendo la resolución de
-        la cámara y la resolución para depuración. Si la cámara no se puede abrir, se
-        imprime un mensaje de error y se finaliza el programa.
-
-        Parámetros:
-        configuration (dict): Un diccionario que contiene la configuración de la cámara,
-                            que incluye:
-            - 'debug_resolution' (str): La resolución de depuración en formato 'ancho x alto'.
-            - 'camera_resolution' (str): La resolución de la cámara en formato 'ancho x alto'.
-            - 'camera_index' (int, opcional): Índice de la cámara (default: auto-detect)
-
-        Raises:
-            SystemExit: Si no se puede abrir la cámara.
-        """
-
-        # Detectar sistema operativo y backend apropiado
-        system = platform.system()
-        if system == 'Linux':
-            backend = cv2.CAP_V4L2  # V4L2 es más estable que V4L en Linux moderno
-        elif system == 'Windows':
-            backend = cv2.CAP_DSHOW  # DirectShow para Windows
-        elif system == 'Darwin':  # macOS
-            backend = cv2.CAP_AVFOUNDATION
-        else:
-            backend = cv2.CAP_ANY  # Fallback
-
-        # Intentar obtener índice de cámara de configuración
-        camera_index = configuration.get('camera_index', None)
-
-        # Auto-detectar cámara si no se especifica
-        if camera_index is None:
-            print(f'Detectando cámara en {system}...')
-            for i in range(5):  # Probar índices 0-4
-                test_cam = cv2.VideoCapture(i, backend)
-                if test_cam.isOpened():
-                    camera_index = i
-                    test_cam.release()
-                    print(f'✓ Cámara encontrada en índice {i}')
-                    break
-
-            if camera_index is None:
-                print('Error: No se detectó ninguna cámara.')
-                print('Intenta especificar "camera_index" en configSystem.json')
-                exit()
-
-        # Inicializar cámara con backend apropiado
-        self.camera = cv2.VideoCapture(camera_index, backend)
-        print(f'Backend de cámara: {backend} (índice {camera_index})')
-
-        self.debugResolution = tuple(map(int, configuration['debug_resolution'].split('x')))
-        width, height = map(int, configuration['camera_resolution'].split('x'))
-        self.cameraResolution = (height, width)
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-
-        if not self.camera.isOpened():
-            print(f'Error: No se pudo abrir la cámara {camera_index}.')
-            print('Cámaras disponibles en tu sistema:')
-            for i in range(5):
-                test = cv2.VideoCapture(i, backend)
-                if test.isOpened():
-                    print(f'  - /dev/video{i} (índice {i})')
-                    test.release()
-            exit()
-
-
-    def cameraCorrection(self, frame):
-        """
-        Desdistorsiona y recorta la imagen de la cámara.
-
-        Este método corrige la distorsión de la imagen utilizando la matriz de calibración de 
-        la cámara y los parámetros de distorsión, y luego recorta la imagen a la región de 
-        interés (ROI) definida. Además, convierte la imagen desdistorsionada de BGR a HSV.
-
-        Parámetros:
-        frame (numpy.ndarray): La imagen de entrada en formato BGR que se va a corregir.
-
-        Returns:
-        tuple: Una tupla que contiene:
-            - frame (numpy.ndarray): La imagen desdistorsionada y recortada en formato BGR.
-            - frameHsv (numpy.ndarray): La imagen convertida a formato HSV.
-        """
-        x, y, w, h = self.roi
-        frame = cv2.undistort(frame, self.cameraMatriz, self.distance, None, self.newCameraMatriz)[y:y+h, x:x+w]
-        frameHsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        return frame, frameHsv
-
-
-    def cameraDebug(self, frameHsv):
-        """
-        Muestra una ventana de depuración con la imagen en formato HSV.
-
-        Este método redimensiona la imagen HSV recibida a una resolución de depuración 
-        definida y la muestra en una ventana. Además, itera sobre los colores en el 
-        sistema de visión y llama a su método de depuración.
-
-        Parámetros:
-        frameHsv (numpy.ndarray): La imagen en formato HSV que se va a mostrar.
-
-        Returns:
-        None
-        """
-        resizeFrameHsv = cv2.resize(frameHsv, self.debugResolution, interpolation=cv2.INTER_AREA)
-        cv2.imshow('Debug Imagen HSV', resizeFrameHsv)
-
-        for color in self.frameColors.values():
-            color.debug()
-
-
-    def processFoundRobots(self, foundRobots, foundColors):
-        """
-        Procesa los robots encontrados y actualiza los colores en el sistema de visión.
-
-        Este método crea instancias de la clase `Robot` para cada robot encontrado,
-        ordenándolos por su identificador. También elimina los colores que no fueron 
-        detectados, cerrando las ventanas de depuración correspondientes si el modo 
-        de depuración está habilitado.
-
-        Parámetros:
-        foundRobots (set): Un conjunto de identificadores de robots encontrados.
-        foundColors (set): Un conjunto de colores que fueron detectados.
-
-        Returns:
-        None
+        - foundRobots (set): IDs de robots detectados visualmente.
         """
         self.robots = {robot: Robot(robot, self.robotsConfig) for robot in sorted(foundRobots, key=int)}
-
-        removeColors = set(self.frameColors) - foundColors
-        for color in removeColors:
-            if self.debug:
-                cv2.destroyWindow(self.frameColors[color].nameWindowDebug)
-            self.frameColors.pop(color)
 
 
     def setupRobots(self, robotIP, robotsIPs, configuredRobots):
         """
         Asocia una dirección IP a un robot en función de la detección del sistema de visión.
 
-        Si no se proporciona una dirección IP se selecciona una de robotsIPs, despues se
+        Si no se proporciona una dirección IP se selecciona una de robotsIPs, después se
         gira el robot para identificar cuál se mueve y se le asigna la dirección IP
-        selecciona.
+        seleccionada.
 
         Parameters:
-        - robotIP (str o None): Dirección IP actual del robot. Si es None, se
-        seleccionara una nueva IP.
+        - robotIP (str o None): Dirección IP actual del robot.
         - robotsIPs (list): Lista de direcciones IP disponibles para asignar a los robots.
         - configuredRobots (set): Conjunto de IDs de robots ya configurados.
 
         Returns:
-        - tuple: Contiene una dirección IP asociada a un robot y un booleano que indica
-        si se obtuvo un frame válido (True si se asoció correctamente, False si se
-        tuvo que mover el robot para asignar una IP).
-
-        Nota:
-            isValidFrame es necesario por como cv2.CAP_DSHOW toma los frames
+        - tuple: (robotIP, isValidFrame)
         """
-        if robotIP == None:
+        if robotIP is None:
             robotIP = self.setupMoveRobot(robotsIPs)
             isValidFrame = False
         else:
@@ -940,14 +481,8 @@ class Base(object):
 
     def printRobots(self):
         """
-        Imprime la lista de robots encontrados y envía una instrucción para que 
+        Imprime la lista de robots encontrados y envía una instrucción para que
         cada robot gire 90 grados en sentido antihorario.
-
-        La función itera sobre todos los robots detectados y para cada uno, 
-        envía una instrucción de giro y muestra su identificador, nombre y dirección IP.
-
-        Returns:
-        - None
         """
         print('Robots encontrados: ')
         for robot in self.robots.values():
@@ -959,10 +494,8 @@ class Base(object):
         """
         Asocia una dirección IP a un robot en función de su desplazamiento angular.
 
-        La función itera sobre los robots detectados y verifica el desplazamiento
-        angular de cada uno. Si el desplazamiento angular es mayor o igual a 45 grados,
-        se asigna la última dirección IP disponible de la lista `robotsIPs` a ese robot
-        y se realiza la configuración de la IP.
+        Con ArUco, el desplazamiento se detecta directamente desde el cambio de ángulo
+        del marker, sin necesidad de comparar círculos de color.
 
         Parameters:
         - robotsIPs (list): Lista de direcciones IP disponibles para los robots.
@@ -972,12 +505,11 @@ class Base(object):
         - None
         """
         for robot in self.robots.values():
-            # Ignorar robots ya configurados
             if robot.id in configuredRobots:
                 continue
 
             displacement = robot.getDisplacement()
-            if displacement != None:
+            if displacement is not None:
                 _, angularDisplacement = displacement
                 if abs(angularDisplacement) >= 45:
                     robotIP = robotsIPs.pop()
@@ -990,11 +522,7 @@ class Base(object):
 
     def setupMoveRobot(self, robotsIPs):
         """
-       Le envía instrucciones para girar al ultimo robot de la lista robotsIPs.
-
-        La función utiliza la última dirección IP de la lista `robotsIPs` y envía 
-        instrucciones al robot para que gire 90 grados y envíe un mensaje a la base. 
-        Luego, espera una respuesta del robot y verifica si está listo.
+        Envía instrucciones para girar al último robot de la lista robotsIPs.
 
         Parameters:
         - robotsIPs (list): Lista de direcciones IP disponibles para los robots.
@@ -1006,186 +534,422 @@ class Base(object):
         instructions = ['TURN|90', 'MESSAGE_BASE|1']
         self.sendInstruction(robotIP, instructions, False)
 
-        self.sock.settimeout(2.0)
-        while True:
+        self.sock.settimeout(0.5)
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
             try:
                 data, addr = self.sock.recvfrom(1024)
                 if addr[0] != self.baseIP and robotIP == addr[0]:
                     message = data.decode()
                     print(f"Respuesta de {addr[0]}: {message}")
-
                     if message == 'READY':
+                        print(f"[Setup] Robot {robotIP} listo")
                         break
             except socket.timeout:
-                break
-        
+                pass
+
         return robotIP
 
 
-    def cameraProcessing(self):
+    # =========================================================================
+    # CONFIGURACIÓN
+    # =========================================================================
+
+    def readConfigFile(self, filePath):
         """
-        Procesa los fotogramas de la cámara para el seguimiento y control de los robots.
+        Lee un archivo de configuración JSON y aplica las configuraciones del sistema.
 
-        Esta función se encarga de leer los fotogramas de la cámara,
-        aplicar el procesamiento de color y buscar los robots en
-        función de su configuración. Controla el intervalo de
-        procesamiento para asegurar que los fotogramas se manejen
-        adecuadamente y gestiona la inicialización de la grabación de
-        video y el registro de tiempos.
+        Cambios respecto al sistema de círculos:
+        - Se elimina la sección 'colors' del JSON.
+        - Se elimina 'circles_radius' y 'distance_between_centers'.
+        - Se agrega 'marker_size_mm' en vision_system.
+        - Se elimina el campo 'colors' de cada robot en la sección 'robots'.
 
-        Durante la ejecución, busca robots en el color definido y
-        envía las posiciones de los robots encontrados.
+        Parámetros:
+        - filePath (str): La ruta del archivo de configuración JSON.
+        """
+        with open(filePath, 'r') as file:
+            configuration = json.load(file)
+
+        self.configVisionSystem(configuration['vision_system'])
+        self.configUdp(configuration['udp_communication'])
+        self.generalConfig(configuration['general'])
+
+        self.robotsConfig = configuration['robots']
+
+
+    def generalConfig(self, configuration):
+        """
+        Configura las opciones generales del sistema a partir de un diccionario de configuración.
+
+        Parámetros:
+        - configuration (dict): Configuración general del sistema.
+        """
+        self.debug = configuration['debug_enable']
+
+        self.pathVideo = configuration['path_save_videos']
+        self.pathPositionLogs = configuration['path_save_position_logs']
+        self.pathConsolelog = configuration['path_save_console_logs']
+
+        for path in [self.pathVideo, self.pathPositionLogs, self.pathConsolelog]:
+            if not os.path.exists(path):
+                print(f"La ruta {path} no existe.")
+                try:
+                    os.makedirs(path)
+                    print(f"Se ha creado la ruta {path}.")
+                except Exception as e:
+                    raise Exception(f"Error al crear la ruta: {e}")
+
+
+    def configUdp(self, configuration):
+        """
+        Configura la comunicación UDP para el sistema.
+
+        Parámetros:
+        - configuration (dict): Configuración UDP.
+        """
+        self.baseIP = configuration['base_ip']
+        self.broadcastIP = configuration['broadcast_ip']
+        self.port = configuration['port']
+        self.networkInterface = configuration.get('network_interface', None)
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        if platform.system() == 'Linux':
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                print('✓ SO_REUSEPORT habilitado (Linux)')
+            except AttributeError:
+                print('⚠ SO_REUSEPORT no disponible en esta versión de Python')
+
+            if self.networkInterface:
+                try:
+                    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                                         self.networkInterface.encode())
+                    print(f'✓ Socket vinculado a interfaz {self.networkInterface}')
+                except (AttributeError, OSError) as e:
+                    print(f'⚠ No se pudo vincular a interfaz {self.networkInterface}: {e}')
+
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**20)
+
+        # Bind en 0.0.0.0 para evitar [Errno 99] cuando base_ip no está asignada
+        # a la interfaz en el momento del bind. SO_BINDTODEVICE (Linux) ya restringe
+        # el tráfico a la interfaz correcta (enp3s0), por lo que el bind amplio es seguro.
+        bindAddress = '0.0.0.0' if platform.system() == 'Linux' else self.baseIP
+        try:
+            self.sock.bind((bindAddress, self.port))
+            print(f'✓ Socket UDP bind exitoso en {bindAddress}:{self.port}')
+            if bindAddress == '0.0.0.0':
+                print(f'  (Tráfico restringido a interfaz {self.networkInterface or "todas"})')
+        except OSError as e:
+            print(f'✗ Error al hacer bind en {bindAddress}:{self.port}')
+            print(f'  Motivo: {e}')
+            raise
+
+
+    def configVisionSystem(self, configuration):
+        """
+        Configura el sistema de visión con soporte ArUco.
+
+        Cambios respecto al sistema de círculos:
+        - Inicializa el detector ArUco con DICT_4X4_50.
+        - Lee marker_size_mm desde la configuración.
+        - Elimina la configuración de circles_radius y distance_between_centers.
+
+        Parámetros:
+        - configuration (dict): Configuración del sistema de visión.
+            Claves requeridas:
+                'path_cameraMatrix', 'path_distance', 'mmPixel',
+                'frame_processing_interval', 'marker_size_mm'
+        """
+        self.setCamera(configuration)
+
+        self.cameraMatriz = np.loadtxt(configuration['path_cameraMatrix'], dtype=float)
+        self.distance = np.loadtxt(configuration['path_distance'], dtype=float)
+        h, w = self.cameraResolution
+        self.newCameraMatriz, self.roi = cv2.getOptimalNewCameraMatrix(
+            self.cameraMatriz, self.distance, (w, h), 1, (w, h)
+        )
+
+        numerator, denominator = map(int, configuration['mmPixel'].split('/'))
+        self.mmPixel = numerator / denominator
+        self.processInterval = configuration['frame_processing_interval']
+
+        # Tamaño físico del marker en mm (recomendado: 80mm+ a 2.5m de distancia)
+        self.markerSizeMm = float(configuration['marker_size_mm'])
+
+        # Radio visual para el resultsFrame (proporcional al tamaño del marker en px)
+        self.bigCircleRadius = max(6, int((self.markerSizeMm / self.mmPixel) * 0.5))
+
+        # Inicializar detector ArUco
+        # DICT_4X4_50: markers 4x4 bits, 50 IDs disponibles — robusto y compacto
+        arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        arucoParams = cv2.aruco.DetectorParameters()
+
+        # Parámetros para markers pequeños a distancia (2.5m+, markers ~30-47px)
+        arucoParams.adaptiveThreshWinSizeMin = 3
+        arucoParams.adaptiveThreshWinSizeMax = 53    # más escalas para markers pequeños
+        arucoParams.adaptiveThreshWinSizeStep = 4    # paso fino: prueba 3,7,11...53 (13 escalas)
+        arucoParams.minMarkerPerimeterRate = 0.005   # ~6px perímetro mínimo en 1280px de ancho
+        arucoParams.maxMarkerPerimeterRate = 4.0
+        arucoParams.polygonalApproxAccuracyRate = 0.08  # más tolerante con bordes suaves
+        arucoParams.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        arucoParams.errorCorrectionRate = 0.8        # más tolerancia a bits mal leídos
+
+        self.arucoDetector = cv2.aruco.ArucoDetector(arucoDict, arucoParams)
+        print(f'✓ Detector ArUco inicializado — DICT_4X4_50, marker: {self.markerSizeMm}mm')
+
+
+    def setCamera(self, configuration):
+        """
+        Inicializa la captura de video desde la cámara.
+
+        Parámetros:
+        - configuration (dict): Configuración de la cámara.
+        """
+        system = platform.system()
+        if system == 'Linux':
+            backend = cv2.CAP_V4L2
+        elif system == 'Windows':
+            backend = cv2.CAP_DSHOW
+        elif system == 'Darwin':
+            backend = cv2.CAP_AVFOUNDATION
+        else:
+            backend = cv2.CAP_ANY
+
+        camera_index = configuration.get('camera_index', None)
+
+        if camera_index is None:
+            print(f'Detectando cámara en {system}...')
+            for i in range(5):
+                test_cam = cv2.VideoCapture(i, backend)
+                if test_cam.isOpened():
+                    camera_index = i
+                    test_cam.release()
+                    print(f'✓ Cámara encontrada en índice {i}')
+                    break
+
+            if camera_index is None:
+                print('Error: No se detectó ninguna cámara.')
+                exit()
+
+        self.cameraIndex = camera_index
+        self.cameraBackend = backend
+        self.camera = cv2.VideoCapture(camera_index, backend)
+        print(f'Backend de cámara: {backend} (índice {camera_index})')
+
+        self.debugResolution = tuple(map(int, configuration['debug_resolution'].split('x')))
+        width, height = map(int, configuration['camera_resolution'].split('x'))
+        self.cameraResolution = (height, width)
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+        if not self.camera.isOpened():
+            print(f'Error: No se pudo abrir la cámara {camera_index}.')
+            for i in range(5):
+                test = cv2.VideoCapture(i, backend)
+                if test.isOpened():
+                    print(f'  - /dev/video{i} (índice {i})')
+                    test.release()
+            exit()
+
+
+    # =========================================================================
+    # PROCESAMIENTO DE FRAMES
+    # =========================================================================
+
+    def cameraCorrection(self, frame):
+        """
+        Desdistorsiona y recorta la imagen de la cámara.
+
+        Parámetros:
+        - frame (ndarray): La imagen de entrada en formato BGR.
+
+        Returns:
+        - frame (ndarray): Imagen corregida en formato BGR.
+        - frameGray (ndarray): Imagen en escala de grises (para uso interno).
+        """
+        x, y, w, h = self.roi
+        frame = cv2.undistort(
+            frame.copy(), self.cameraMatriz, self.distance, None, self.newCameraMatriz
+        )[y:y+h, x:x+w]
+        frameGray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        return frame, frameGray
+
+
+    def processFrame(self, frame):
+        """
+        Procesa un frame de la cámara: corrige distorsión, detecta markers ArUco
+        y actualiza currentArucoDetections.
+
+        Reemplaza processFrameColors. Ya no se procesan colores HSV ni se lanzan
+        hilos por color — la detección ArUco opera sobre el frame BGR completo.
+
+        Parámetros:
+        - frame (ndarray): Frame BGR crudo de la cámara.
 
         Retorna:
-        - None
+        - frame (ndarray): Frame corregido por distorsión en BGR.
+        - frameGray (ndarray): Frame en escala de grises.
+        """
+        frame, frameGray = self.cameraCorrection(frame)
+
+        # Detección ArUco — actualiza el diccionario accedido por Robot.getPose()
+        self.currentArucoDetections = self.detectArucoMarkers(frame)
+
+        if self.debug:
+            self.cameraDebug(frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                self.debug = 'off'
+
+        return frame, frameGray
+
+
+    def cameraDebug(self, frame):
+        """
+        Muestra una ventana de depuración con los markers ArUco anotados.
+
+        Parámetros:
+        - frame (ndarray): Frame BGR ya corregido.
+        """
+        debugFrame = self.drawArucoDebug(frame.copy())
+        resized = cv2.resize(debugFrame, self.debugResolution, interpolation=cv2.INTER_AREA)
+        cv2.imshow('Debug ArUco', resized)
+
+
+    # =========================================================================
+    # LOOP PRINCIPAL
+    # =========================================================================
+
+    def cameraProcessing(self):
+        """
+        Loop principal de procesamiento de cámara.
+
+        Fases:
+        1. Detección visual: busca markers ArUco hasta encontrar numRobots robots.
+        2. Setup de red: asocia IPs a robots por desplazamiento angular.
+        3. Operación: envía poses a los robots en cada frame.
+
+        El flujo es idéntico al sistema de círculos, solo cambia la fuente de
+        detección (ArUco en lugar de HSV + contornos).
         """
         robotIP = None
         isValidFrame = True
         robotsIPs = []
         foundRobots = set()
-        configuredRobots = set()  # Rastrea robots ya configurados con IP
+        configuredRobots = set()
         lastProcessedTime = time.time()
+        lastStatusTime = time.time()
         executed = False
 
+        failCount = 0
+
         while True:
-            _, frame = self.camera.read()
+            ret, frame = self.camera.read()
+
+            if not ret or frame is None:
+                failCount += 1
+                if failCount % 30 == 1:
+                    print(f"[CAM] Fallo de lectura (#{failCount}), reintentando...")
+                if failCount >= 30:
+                    print("[CAM] Reabriendo cámara...")
+                    self.camera.release()
+                    self.camera = cv2.VideoCapture(self.cameraIndex, self.cameraBackend)
+                    failCount = 0
+                continue
+
+            failCount = 0
 
             if time.time() - lastProcessedTime < self.processInterval or not isValidFrame:
                 isValidFrame = True
-                if (self.debug == 'off' or not self.threadInputAlive or not self.videoProcess.is_alive()) and executed == True:
+                if (self.debug == 'off' or not self.threadInputAlive or
+                        not self.videoProcess.is_alive()) and executed:
                     self.cleanup()
                     break
                 continue
 
             lastProcessedTime = time.time()
-            frame, frameHsv = self.processFrameColors(frame)
+            frame, frameGray = self.processFrame(frame)
 
             if len(foundRobots) < self.numRobots:
-                foundRobots, foundColors = self.searchRobotsColor(self.robotsConfig)
+                foundRobots, _ = self.searchRobotsAruco(self.robotsConfig)
+
+                if time.time() - lastStatusTime >= 2.0:
+                    lastStatusTime = time.time()
+                    visible = list(self.currentArucoDetections.keys())
+                    print(f"[Búsqueda] Robots detectados: {sorted(foundRobots)} / "
+                          f"necesarios: {self.numRobots} | "
+                          f"ArUco visibles: {visible}")
+
                 if len(foundRobots) == self.numRobots:
+                    print(f"[Búsqueda] Todos los robots encontrados: {sorted(foundRobots)}")
                     robotsIPs = self.searchRobotsUdp()
-                    self.processFoundRobots(foundRobots, foundColors)
+                    self.processFoundRobots(foundRobots)
+
             elif len(robotsIPs) != 0:
                 robotIP, isValidFrame = self.setupRobots(robotIP, robotsIPs, configuredRobots)
+
             else:
                 if not executed:
-                    executed, resultsFrame = self.initializeVideoAndLogging(frameHsv.shape[:2])
-                    # self.createTimeLog()
+                    executed, resultsFrame = self.initializeVideoAndLogging(frame.shape[:2])
+                    if not executed:
+                        # initializeVideoAndLogging falló — reintentar en el próximo frame
+                        continue
 
                 timeLog = round((time.time() - self.startTime), 1)
+                processingStart = time.time()
                 self.sendPositions(resultsFrame, timeLog)
                 self.addFrame(frame, resultsFrame, timeLog)
-
-                # processingTime = round((time.time() - lastProcessedTime) * 1000, 1)
-                # self.addTimeLog(timeLog, processingTime)
+                self.addTimeLog(timeLog, round(time.time() - processingStart, 4))
 
 
-    def createTimeLog(self):
-        """
-        Crea un registro de tiempo para el procesamiento de los robots.
-
-        Esta función genera un archivo CSV que registra el tiempo y el 
-        tiempo de procesamiento durante la ejecución del sistema. El nombre 
-        del archivo se basa en la fecha y la hora actuales, así como en 
-        el número de robots en operación. 
-
-        - Se crea un directorio llamado 'Logs' (si no existe) para almacenar 
-        el archivo de registro.
-        - Se establece un encabezado en el archivo CSV que incluye 
-        las columnas 'time' y 'processingTime'.
-
-        Returns:
-        - None
-        """
-        currentTime = datetime.now().strftime(r'%d-%m_%H-%M')
-        logName = f'Time_Log_{currentTime}_Robots_{self.numRobots}.csv'
-        self.pathTimeLogs = os.path.join('Logs', logName)
-        header = ['time' , 'processingTime']
-        with open(self.pathTimeLogs, 'w', newline='') as f:
-            csv.writer(f).writerow(header)
-
-
-    def addTimeLog(self, timeLog, processingTime):
-        """
-        Agrega una entrada al registro de tiempo de procesamiento.
-
-        Esta función añade una nueva fila al archivo de registro de tiempo 
-        previamente creado, con la información del tiempo actual y el tiempo 
-        de procesamiento correspondiente. La fila se agrega al final del 
-        archivo CSV especificado en `self.pathTimeLogs`.
-
-        Parámetros:
-        - timeLog (str): El tiempo actual en el formato especificado 
-                        para el registro.
-        - processingTime (float): El tiempo de procesamiento en milisegundos 
-                                que se desea registrar.
-
-        Returns:
-        - None
-        """
-        row = [timeLog, processingTime]
-        with open(self.pathTimeLogs, 'a', newline='') as f:
-            csv.writer(f).writerow(row)
-
+    # =========================================================================
+    # ENVÍO DE POSICIONES Y LOGGING
+    # =========================================================================
 
     def sendPositions(self, resultsFrame, timeLog):
         """
         Envía las posiciones de los robots y actualiza el registro de posiciones.
 
-        Esta función itera sobre cada robot registrado, obtiene su desplazamiento
-        y si está disponible, envía su posición actual. Además, dibuja un círculo
-        en el frame de resultados en la posición del robot y agrega la información
-        de la posición al registro de posiciones.
-
         Parámetros:
-        - resultsFrame (numpy.ndarray): El frame de resultados donde se dibujarán
-                                        los círculos representando las posiciones
-                                        de los robots.
-        - timeLog (str): El tiempo actual que se usará para registrar las posiciones.
-
-        Returns:
-        - None
+        - resultsFrame (ndarray): Frame de resultados donde se dibuja la posición.
+        - timeLog (float): Tiempo actual desde el inicio.
         """
         for robot in self.robots.values():
             displacement = robot.getDisplacement()
-            if displacement != None:
+            if displacement is not None:
                 x, y, angle = robot.previousPose
                 self.createCircle(resultsFrame, x, y)
 
                 instruction = f'POSE|{x}|{y}|{angle}'
                 self.sendInstruction(robot.IP, [instruction], False)
 
-                self.addPositionLog(timeLog, robot.id, robot.name, robot.previousPose, displacement)
+                self.addPositionLog(timeLog, robot.id, robot.name,
+                                    robot.previousPose, displacement)
 
 
     def initializeVideoAndLogging(self, resolution):
         """
         Inicializa el proceso de grabación de video y el registro de posiciones.
 
-        Esta función crea un frame de resultados en blanco y configura el
-        proceso de grabación de video utilizando los parámetros proporcionados.
-        También inicializa el registro de posiciones de los robots y dibuja
-        círculos en el frame de resultados en las posiciones iniciales de
-        cada robot.
-
         Parámetros:
-        - resolution (tuple): Una tupla que contiene la altura y el ancho
-                            del marco de video.
+        - resolution (tuple): (alto, ancho) del frame.
 
         Returns:
-        - tuple: Un tuple que contiene un valor booleano indicando el éxito
-                de la inicialización y el marco de resultados (resultsFrame)
-                creado.
+        - tuple: (True, resultsFrame)
         """
         h, w = resolution
         resultsFrame = np.full((h, w, 3), (255, 255, 255), dtype=np.uint8)
 
         self.frameQueue = multiprocessing.Queue()
         args = (
-            resolution, 
-            self.numRobots, 
-            self.pathVideo, 
-            self.processInterval, 
+            resolution,
+            self.numRobots,
+            self.pathVideo,
+            self.processInterval,
             self.frameQueue,
             self.debugResolution
         )
@@ -1193,6 +957,8 @@ class Base(object):
         self.videoProcess.start()
         self.startTime = time.time()
         self.createPositionLog()
+        self.createTimeLog()
+
         for robot in self.robots.values():
             x, y, _ = robot.previousPose
             self.createCircle(resultsFrame, x, y)
@@ -1206,19 +972,12 @@ class Base(object):
 
     def createCircle(self, resultsFrame, x, y):
         """
-        Dibuja un círculo en el frame de resultados en las coordenadas especificadas.
-
-        Esta función convierte las coordenadas (x, y) de milímetros a píxeles
-        utilizando la relación de escala definida por mmPixel y dibuja un círculo
-        en el frame de resultados con un radio predefinido (bigCircleRadius).
+        Dibuja un círculo en el frame de resultados representando la posición de un robot.
 
         Parámetros:
-        - resultsFrame (numpy.ndarray): El frame de resultados donde se dibujará el círculo.
-        - x (float): La coordenada x de la posición en milímetros.
-        - y (float): La coordenada y de la posición en milímetros.
-        
-        Retorna:
-        - None
+        - resultsFrame (ndarray): Frame de resultados.
+        - x (float): Coordenada x en mm.
+        - y (float): Coordenada y en mm.
         """
         printX = int(x / self.mmPixel)
         printY = int(y / self.mmPixel)
@@ -1228,17 +987,10 @@ class Base(object):
     def cleanup(self):
         """
         Libera los recursos utilizados por la cámara y cierra las ventanas de OpenCV.
-
-        Esta función se encarga de liberar la cámara, limpiar la cola de fotogramas 
-        y cerrar todas las ventanas abiertas de OpenCV. Asegura que no queden 
-        recursos ocupados al finalizar la captura de video.
-
-        Retorna:
-        - None
         """
         self.camera.release()
-        
-        if self.frameQueue != None:
+
+        if self.frameQueue is not None:
             self.frameQueue.put(None)
             time.sleep(0.2)
             while not self.frameQueue.empty():
@@ -1248,169 +1000,87 @@ class Base(object):
         cv2.destroyAllWindows()
 
 
-    def processFrameColors(self, frame):
-        """
-        Procesa un fotograma de la cámara, corrige la imagen y aplica el procesamiento 
-        de color en paralelo.
-
-        Esta función realiza la corrección de la cámara en el fotograma recibido, 
-        convierte el fotograma a espacio de color HSV y luego inicia hilos para 
-        procesar los colores definidos en el sistema de visión. Al finalizar el 
-        procesamiento, se une a todos los hilos y si el modo de depuración está 
-        habilitado, muestra el fotograma procesado.
-
-        Parámetros:
-        - frame (ndarray): El fotograma de la cámara en formato BGR que se va a procesar.
-
-        Retorna:
-        - tuple (frame, frameHsv): Una tupla que contiene el fotograma corregido en formato
-                                    BGR y el fotograma en formato HSV.
-        """
-        frame, frameHsv = self.cameraCorrection(frame)
-
-        threads = []
-        for color in self.frameColors.values():
-            t = threading.Thread(target=color.processFrame, args=(frameHsv,))
-            t.start()
-            threads.append(t)
-
-        for t in threads:
-            t.join()
-        
-        if self.debug:
-            self.cameraDebug(frameHsv)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                self.debug = 'off'
-
-        return frame, frameHsv 
-
-
     def addFrame(self, frame, resultsFrame, timeLog):
         """
-        Agrega un fotograma y el fotograma de resultados a la cola de procesamiento, 
-        y superpone información de tiempo en el fotograma.
-
-        Esta función toma el fotograma actual y el fotograma de resultados, 
-        añade un texto que indica el tiempo transcurridoa. Luego, se coloca los
-        fotogramas en la cola para su procesamiento posterior.
+        Agrega un fotograma y el frame de resultados a la cola de procesamiento.
 
         Parámetros:
-        - frame (ndarray): El fotograma actual de la cámara en formato BGR al que se
-                            le va a agregar la información de tiempo.
-        - resultsFrame (ndarray): El fotograma de resultados que se va a enviar a la cola.
-        - timeLog (float): El tiempo transcurrido desde el inicio del procesamiento, en segundos.
-
-        Retorna:
-        - None
+        - frame (ndarray): Frame actual de la cámara.
+        - resultsFrame (ndarray): Frame de resultados.
+        - timeLog (float): Tiempo transcurrido en segundos.
         """
         text = f'Time: {timeLog} s'
         position = (2, 26)
         cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 200), 1, cv2.LINE_AA)
-
         self.frameQueue.put([frame, resultsFrame])
-    
+
+
+    # =========================================================================
+    # LOGGING
+    # =========================================================================
+
+    def createTimeLog(self):
+        """Crea un archivo CSV de registro de tiempos de procesamiento."""
+        currentTime = datetime.now().strftime(r'%d-%m_%H-%M')
+        logName = f'Time_Log_{currentTime}_Robots_{self.numRobots}.csv'
+        self.pathTimeLogs = os.path.join('Logs', logName)
+        header = ['time', 'processingTime']
+        with open(self.pathTimeLogs, 'w', newline='') as f:
+            csv.writer(f).writerow(header)
+
+
+    def addTimeLog(self, timeLog, processingTime):
+        """Agrega una entrada al registro de tiempo de procesamiento."""
+        row = [timeLog, processingTime]
+        with open(self.pathTimeLogs, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+
 
     def createPositionLog(self):
-        """
-        Crea un archivo de registro para almacenar la posición de los robots.
-
-        Esta función genera un archivo CSV para registrar la información de 
-        la posición de los robots, incluyendo el tiempo, el ID del robot, 
-        el nombre del robot, sus coordenadas (x, y), el ángulo, el 
-        desplazamiento lineal y el desplazamiento angular. El nombre del 
-        archivo incluye la fecha y hora actuales, así como el número de 
-        robots involucrados.
-
-        Retorna:
-        - None
-        """
+        """Crea un archivo CSV de registro de posiciones de robots."""
         currentTime = datetime.now().strftime(r'%d-%m_%H-%M')
         logName = f'Position_Log_{currentTime}_Robots_{self.numRobots}.csv'
         self.pathPositionLogs = os.path.join(self.pathPositionLogs, logName)
-        header = ['time' , 'idrobot', 'robot', 'x', 'y', 'angle', 'linearDisplacement', 'angularDisplacement']
+        header = ['time', 'idrobot', 'robot', 'x', 'y', 'angle',
+                  'linearDisplacement', 'angularDisplacement']
         with open(self.pathPositionLogs, 'w', newline='') as f:
             csv.writer(f).writerow(header)
 
 
     def addPositionLog(self, timeLog, id, name, position, displacement):
-        """
-        Agrega una entrada al registro de posiciones de los robots. Los datos 
-        se agregan al final del archivo CSV.
-
-        Parámetros:
-        - timeLog (float): Tiempo transcurrido desde el inicio del proceso.
-        - id (int): ID del robot.
-        - name (str): Nombre del robot.
-        - position (tuple): Tupla que contiene las coordenadas (x, y) y el ángulo del robot.
-        - displacement (tuple): Tupla que contiene el desplazamiento lineal y angular del robot.
-
-        Retorna:
-        - None
-        """
+        """Agrega una entrada al registro de posiciones de los robots."""
         row = [timeLog, id, name, *position, *displacement]
         with open(self.pathPositionLogs, 'a', newline='') as f:
             csv.writer(f).writerow(row)
 
 
-    def sendInstructionBroadcast(self, instructions):
-        """
-        Envía un conjunto de instrucciones a través de broadcast a los robots.
-
-        Esta función toma una lista de instrucciones y las envía a todos los 
-        robots disponibles en la red. También imprime un mensaje en la consola
-        confirmando el envío de cada instrucción.
-
-        Parámetros:
-        - instructions (list): Lista de cadenas de texto que representan las 
-                            instrucciones a enviar.
-
-        Retorna:
-        - None
-        """
-        for instruction in instructions:
-            self.sock.sendto(instruction.encode(), (self.broadcastIP, self.port))
-            print(f"(Broadcast) Mensaje enviado: {instruction}")
+    def createConcoleLog(self):
+        """Crea un archivo CSV de registro de mensajes UDP recibidos."""
+        currentTime = datetime.now().strftime(r'%d-%m_%H-%M')
+        logName = f'Console_Log_{currentTime}_Robots_{self.numRobots}.csv'
+        self.pathConsolelog = os.path.join(self.pathConsolelog, logName)
+        header = ['time', 'idrobot', 'robot', 'message']
+        with open(self.pathConsolelog, 'w', newline='') as f:
+            csv.writer(f).writerow(header)
 
 
-    @runOnThread
-    def sendInstruction(self, ip, instructions, printing):
-        """
-        Envía un conjunto de instrucciones a un robot específico.
+    def addConcoleLog(self, timeLog, id, name, message):
+        """Agrega una entrada al registro de la consola UDP."""
+        row = [timeLog, id, name, message]
+        with open(self.pathConsolelog, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
 
-        Esta función toma una lista de instrucciones y las envía al robot 
-        cuya dirección IP se proporciona. Si se especifica, se imprime un
-        mensaje en la consola confirmando el envío de cada instrucción
-        junto con el nombre del robot destinatario.
 
-        Parámetros:
-        - ip (str): La dirección IP del robot al que se enviarán las instrucciones.
-        - instructions (list): Lista de cadenas de texto que representan las 
-                            instrucciones a enviar.
-        - printing (bool): Indica si se deben imprimir mensajes de confirmación 
-                        en la consola.
-
-        Retorna:
-        - None
-        """
-        for instruction in instructions:
-            self.sock.sendto(instruction.encode(), (ip, self.port))
-            name = next((robot.name for robot in self.robots.values() if robot.IP == ip), ip)
-            if printing:
-                print(f"Mensaje enviado a {name}: {instruction}")
-
+    # =========================================================================
+    # COMUNICACIÓN UDP
+    # =========================================================================
 
     def searchRobotsUdp(self):
         """
         Busca robots en la red mediante transmisión UDP.
 
-        Esta función envía una instrucción de configuración de inicio a 
-        la dirección IP de broadcast y espera recibir respuestas de los 
-        robots en la red. Si no se reciben respuestas dentro de un tiempo
-        de espera, se vuelve a enviar la instrucción.
-
         Retorna:
-        - list: Una lista de direcciones IP de los robots encontrados en la 
-                red.
+        - list: Lista de IPs de robots encontrados.
         """
         instruction = [f'CONFIG|START|{self.broadcastIP}']
         self.sendInstructionBroadcast(instruction)
@@ -1428,70 +1098,130 @@ class Base(object):
                     self.sendInstructionBroadcast(instruction)
                 except OSError as e:
                     print(f"⚠ Error al reenviar broadcast: {e}")
-                    print("  Verifica la configuración de red e interfaz en configSystem.json")
                     break
 
         return list(robotsIPs)
 
 
-    def createConcoleLog(self):
+    def sendInstructionBroadcast(self, instructions):
+        """Envía instrucciones a todos los robots por broadcast."""
+        for instruction in instructions:
+            self.sock.sendto(instruction.encode(), (self.broadcastIP, self.port))
+            print(f"(Broadcast) Mensaje enviado: {instruction}")
+
+
+    @runOnThread
+    def sendInstruction(self, ip, instructions, printing):
         """
-        Crea un archivo de registro para la consola.
-
-        Esta función genera un archivo CSV para registrar los mensajes 
-        resibidos desde la comunicacion UDP, incluyendo información sobre el 
-        tiempo, el ID del robot y el mensaje correspondiente. El nombre 
-        del archivo se basa en la fecha y hora actuales, así como en el 
-        número de robots.
-
-        Retorna:
-        - None
-        """
-        currentTime = datetime.now().strftime(r'%d-%m_%H-%M')
-        logName = f'Console_Log_{currentTime}_Robots_{self.numRobots}.csv'
-        self.pathConsolelog = os.path.join(self.pathConsolelog, logName)
-        header = ['time' , 'idrobot', 'robot', 'message']
-        with open(self.pathConsolelog, 'w', newline='') as f:
-            csv.writer(f).writerow(header)
-
-
-    def addConcoleLog(self, timeLog, id, name, message):
-        """
-        Agrega una entrada al registro de la consola.
-
-        Esta función añade una fila al archivo de registro de la consola 
-        con la información recibida. Esto permite llevar un 
-        seguimiento de los eventos y mensajes recibidos durante la 
-        ejecución del sistema.
+        Envía instrucciones a un robot específico por IP.
 
         Parámetros:
-        - timeLog (str): El tiempo en el que se registra el evento.
-        - id (str): El ID del robot que envía el mensaje.
-        - name (str): El nombre del robot que envía el mensaje.
-        - message (str): El mensaje que se va a registrar.
-
-        Retorna:
-        - None
+        - ip (str): Dirección IP del robot.
+        - instructions (list): Lista de instrucciones a enviar.
+        - printing (bool): Si True, imprime confirmación en consola.
         """
-        row = [timeLog, id, name, message]
-        with open(self.pathConsolelog, 'a', newline='') as f:
-            csv.writer(f).writerow(row)
+        for instruction in instructions:
+            self.sock.sendto(instruction.encode(), (ip, self.port))
+            name = next((robot.name for robot in self.robots.values() if robot.IP == ip), ip)
+            if printing:
+                print(f"Mensaje enviado a {name}: {instruction}")
 
-    
+
+    @runOnThread
+    def readUdpConnection(self):
+        """
+        Escucha y procesa mensajes recibidos a través de la conexión UDP.
+        """
+        self.createConcoleLog()
+        self.sock.settimeout(None)
+
+        while True:
+            data, addr = self.sock.recvfrom(1024)
+            ip = addr[0]
+
+            if ip != self.baseIP:
+                message = data.decode()
+                timeLog = round(time.time() - self.startTime, 1)
+
+                robotFound = False
+                for robot in self.robots.values():
+                    if robot.IP == ip:
+                        name, id = robot.name, robot.id
+                        robotFound = True
+                        break
+
+                if not robotFound:
+                    name, id = ip, "-1"
+
+                self.addConcoleLog(timeLog, id, name, message)
+
+                parts = message.split('|')
+                command = parts[0]
+
+                if command == 'REQUEST_POSITION':
+                    if robotFound:
+                        self.sendPositionToRobot(ip, id)
+                        print(f"Solicitud de posición de {name}")
+
+                elif command == 'LEADER_POSITION':
+                    if len(parts) >= 5:
+                        leaderID = parts[1]
+                        leaderX = float(parts[2])
+                        leaderY = float(parts[3])
+                        leaderAngle = float(parts[4])
+                        self.updateRobotPosition(leaderID, leaderX, leaderY, leaderAngle)
+                        print(f"Posición de líder {leaderID}: x={leaderX}, y={leaderY}, angle={leaderAngle}")
+
+                elif command == 'CHECK_OBSTACLE':
+                    continue
+
+                else:
+                    print(f"Mensaje de {name}: {message}")
+
+
+    @runOnThread
+    def sendPositionToRobot(self, robotIP, robotID):
+        """
+        Envía la posición actual de un robot específico vía UDP.
+
+        Parámetros:
+        - robotIP (str): IP del robot.
+        - robotID (str): ID del robot.
+        """
+        if robotID not in self.robots:
+            print(f"Robot {robotID} no encontrado")
+            return
+
+        robot = self.robots[robotID]
+        x, y, angle = robot.getPose()
+
+        if x == -1 and y == -1 and angle == -1:
+            print(f"Posición no disponible para robot {robotID} (no visible en ArUco)")
+            return
+
+        message = f'POSITION_RESPONSE|{x}|{y}|{angle}'
+        self.sendInstruction(robotIP, [message], False)
+        print(f"Posición enviada a {robot.name}: x={x}, y={y}, angle={angle}")
+
+
+    # =========================================================================
+    # CONGREGACIÓN Y NAVEGACIÓN GLOBAL
+    # =========================================================================
+
     def startCongregation(self, leaderID):
         """
         Inicia el proceso de congregación con un líder designado.
-        
+
         Parámetros:
-        - leaderID (str): ID del robot líder
+        - leaderID (str): ID del robot líder.
         """
         if leaderID not in self.robots:
             print(f"Error: Robot líder {leaderID} no encontrado")
             return
-        
+
         self.congregationActive = True
         self.leaderID = leaderID
-        
+
         instruction = f'CONGREGATION|{leaderID}'
         self.sendInstructionBroadcast([instruction])
         print(f"Congregación iniciada. Líder: {self.robots[leaderID].name}")
@@ -1500,100 +1230,94 @@ class Base(object):
     def sendToGlobalPosition(self, robotID, targetX, targetY):
         """
         Envía un robot a una posición global específica.
-        
+
         Parámetros:
-        - robotID (str): ID del robot
-        - targetX (float): Coordenada X objetivo
-        - targetY (float): Coordenada Y objetivo
+        - robotID (str): ID del robot.
+        - targetX (float): Coordenada X objetivo en mm.
+        - targetY (float): Coordenada Y objetivo en mm.
         """
         if robotID not in self.robots:
             print(f"Error: Robot {robotID} no encontrado")
             return
-        
+
         robot = self.robots[robotID]
         instruction = f'POSITIONGT|{targetX}|{targetY}'
         self.sendInstruction(robot.IP, [instruction], True)
         print(f"Robot {robot.name} enviado a posición: x={targetX}, y={targetY}")
 
+
     def updateRobotPosition(self, robotID, x, y, angle):
         """
         Actualiza la posición de un robot en el registro interno.
-        
+
         Parámetros:
-        - robotID (str): ID del robot
-        - x (float): Coordenada X
-        - y (float): Coordenada Y  
-        - angle (float): Ángulo en grados
+        - robotID (str): ID del robot.
+        - x, y (float): Coordenadas en mm.
+        - angle (float): Ángulo en grados.
         """
         self.robotPositions[robotID] = {
-            'x': x,
-            'y': y,
-            'angle': angle,
+            'x': x, 'y': y, 'angle': angle,
             'timestamp': time.time()
         }
+
 
     def getDistanceBetweenRobots(self, robotID1, robotID2):
         """
         Calcula la distancia euclidiana entre dos robots.
-        
-        Parámetros:
-        - robotID1 (str): ID del primer robot
-        - robotID2 (str): ID del segundo robot
-        
+
         Retorna:
-        - float: Distancia en milímetros, o -1 si algún robot no existe
+        - float: Distancia en mm, o -1 si algún robot no existe o no tiene pose.
         """
         if robotID1 not in self.robots or robotID2 not in self.robots:
             return -1
-        
+
         x1, y1, _ = self.robots[robotID1].previousPose
         x2, y2, _ = self.robots[robotID2].previousPose
-        
+
         if x1 == -1 or x2 == -1:
             return -1
-        
+
         return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-    
+
+
     def isCongregationComplete(self, threshold=100):
         """
         Verifica si todos los robots están cerca del líder.
-        
+
         Parámetros:
-        - threshold (float): Distancia máxima en mm para considerar "cerca"
-        
+        - threshold (float): Distancia máxima en mm para considerar "cerca".
+
         Retorna:
-        - bool: True si todos están cerca del líder
+        - bool: True si todos están dentro del umbral respecto al líder.
         """
         if not self.congregationActive or self.leaderID is None:
             return False
-        
+
         for robotID in self.robots:
             if robotID == self.leaderID:
                 continue
-            
             distance = self.getDistanceBetweenRobots(self.leaderID, robotID)
             if distance == -1 or distance > threshold:
                 return False
-        
+
         return True
+
+
+    # =========================================================================
+    # ENTRADA DE USUARIO
+    # =========================================================================
 
     @runOnThread
     def inputInstruction(self):
         """
-        Maneja la entrada de instrucciones desde la consola.
+        Maneja la entrada de instrucciones desde la consola en tiempo real.
 
-        Esta función permite al usuario ingresar instrucciones para los 
-        robots en tiempo real. Las instrucciones pueden dirigirse a un 
-        robot específico utilizando su ID o ser enviadas como un 
-        mensaje de broadcast. Si el usuario ingresa 'BREAK', la función 
-        finalizará.
-
-        El formato de entrada debe ser 'robotId.instrucción'. Si se 
-        ingresa un ID de robot no válido o un formato incorrecto, se 
-        mostrará un mensaje de error.
-
-        Retorna:
-        - None
+        Formato: 'robotId.instrucción' o comandos especiales:
+            BROADCAST.instrucción
+            CONGREGATION.leaderID
+            GOTO.robotID x y
+            STATUS.(cualquier cosa)
+            BREAK
         """
         while True:
             instructionRaw = input('').strip()
@@ -1612,12 +1336,8 @@ class Base(object):
                 robotIP = self.robots[robotId].IP
                 self.sendInstruction(robotIP, [instruction], True)
             elif robotId == 'CONGREGATION':
-                # Formato: CONGREGATION.leaderID
-                leaderID = instruction
-                self.startCongregation(leaderID)
-
+                self.startCongregation(instruction)
             elif robotId == 'GOTO':
-                # Formato: GOTO.robotID x y
                 parts = instruction.split()
                 if len(parts) == 3:
                     targetRobotID = parts[0]
@@ -1626,127 +1346,35 @@ class Base(object):
                     self.sendToGlobalPosition(targetRobotID, targetX, targetY)
                 else:
                     print("Formato: GOTO.robotID x y")
-
             elif robotId == 'STATUS':
-                # Muestra estado de congregación
                 if self.congregationActive:
                     print(f"Congregación activa. Líder: {self.leaderID}")
                     print(f"Completa: {self.isCongregationComplete()}")
+                    print(f"Detecciones ArUco activas: {list(self.currentArucoDetections.keys())}")
                 else:
                     print("No hay congregación activa")
+                    print(f"Detecciones ArUco activas: {list(self.currentArucoDetections.keys())}")
             else:
                 print(f"Robot ID '{robotId}' no encontrado.")
-                    
-                self.threadInputAlive = False
+
+        self.threadInputAlive = False
 
 
-    @runOnThread
-    def readUdpConnection(self):
-        """
-        Escucha y procesa mensajes recibidos a través de la conexión UDP.
-        VERSIÓN EXTENDIDA con soporte para congregación.
-        """
-        self.createConcoleLog()
-        self.sock.settimeout(None)
-        
-        while True:
-            data, addr = self.sock.recvfrom(1024)
-            ip = addr[0]
-            
-            if ip != self.baseIP:
-                message = data.decode()
-                timeLog = round(time.time() - self.startTime, 1)
-                
-                # Buscar robot por IP
-                robotFound = False
-                for robot in self.robots.values():
-                    if robot.IP == ip:
-                        name, id = robot.name, robot.id
-                        robotFound = True
-                        break
-                
-                if not robotFound:
-                    name, id = ip, "-1"
-                
-                self.addConcoleLog(timeLog, id, name, message)
-                
-                # Parsear mensaje
-                parts = message.split('|')
-                command = parts[0]
-                
-                # ========== NUEVOS COMANDOS ==========
-                
-                if command == 'REQUEST_POSITION':
-                    # Robot solicita su posición actual
-                    if robotFound:
-                        self.sendPositionToRobot(ip, id)
-                        print(f"Solicitud de posición de {name}")
-                    
-                elif command == 'LEADER_POSITION':
-                    # Líder broadcast su posición para congregación
-                    if len(parts) >= 5:
-                        leaderID = parts[1]
-                        leaderX = float(parts[2])
-                        leaderY = float(parts[3])
-                        leaderAngle = float(parts[4])
-                        
-                        self.updateRobotPosition(leaderID, leaderX, leaderY, leaderAngle)
-                        print(f"Posición de líder {leaderID}: x={leaderX}, y={leaderY}, angle={leaderAngle}")
-                
-                # ========== COMANDOS EXISTENTES ==========
-                
-                elif command == 'CHECK_OBSTACLE':
-                    continue
-                    
-                else:
-                    print(f"Mensaje de {name}: {message}")
-    
-
-    @runOnThread
-    def sendPositionToRobot(self, robotIP, robotID):
-        """
-        Envía la posición actual de un robot específico.
-        
-        Parámetros:
-        - robotIP (str): Dirección IP del robot
-        - robotID (str): ID del robot que solicita posición
-        """
-        if robotID not in self.robots:
-            print(f"Robot {robotID} no encontrado")
-            return
-        
-        robot = self.robots[robotID]
-        x, y, angle = robot.previousPose
-        
-        if x == -1 and y == -1 and angle == -1:
-            print(f"Posición no disponible para robot {robotID}")
-            return
-        
-        message = f'POSITION_RESPONSE|{x}|{y}|{angle}'
-        self.sendInstruction(robotIP, [message], False)
-        print(f"Posición enviada a {robot.name}: x={x}, y={y}, angle={angle}")
-
-
+# =============================================================================
+# PUNTO DE ENTRADA
+# =============================================================================
 
 base = Base()
 
-def main():
-    """
-    Punto de entrada principal para el sistema de enjambre.
 
-    Esta función se encarga de inicializar la base del sistema y 
-    gestionar la configuración de los robots a partir de un archivo 
-    de configuración. Solicita al usuario la cantidad de robots 
-    que participarán en la prueba, lee la configuración desde un 
-    archivo JSON y luego inicia el procesamiento de la cámara 
-    para el control y seguimiento de los robots.
-    """
+def main():
+    
     configurationFilePath = 'configSystem.json'
     base.numRobots = int(input('Cantidad de robots en la prueba: '))
 
     base.readConfigFile(configurationFilePath)
     base.cameraProcessing()
-    
+
 
 if __name__ == '__main__':
     main()

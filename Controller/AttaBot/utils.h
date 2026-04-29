@@ -119,19 +119,32 @@ struct pidController {
 
 /***************************************************************************************
  * Estructura que almacena los valores de bias para sensores IMU.
+ *
+ * Los valores se persisten mediante Preferences (namespace "attabot-config"),
+ * por lo que no se necesitan campos de integridad (header/checksum).
+ * La validez se determina verificando si la clave existe en Preferences.
  ***************************************************************************************/
 struct biasStore {
-  int32_t header = 0x42;
-  int32_t biasGyroX = 0;
-  int32_t biasGyroY = 0;
-  int32_t biasGyroZ = 0;
+  int32_t biasGyroX  = 0;
+  int32_t biasGyroY  = 0;
+  int32_t biasGyroZ  = 0;
   int32_t biasAccelX = 0;
   int32_t biasAccelY = 0;
   int32_t biasAccelZ = 0;
   int32_t biasCPassX = 0;
   int32_t biasCPassY = 0;
   int32_t biasCPassZ = 0;
-  int32_t sum = 0;
+
+  // Retorna true si al menos el bias de giroscopio X fue guardado anteriormente.
+  bool IsValid() const {
+    return biasGyroX != 0 || biasGyroY != 0 || biasGyroZ != 0;
+  }
+
+  void Clear() {
+    biasGyroX  = 0; biasGyroY  = 0; biasGyroZ  = 0;
+    biasAccelX = 0; biasAccelY = 0; biasAccelZ = 0;
+    biasCPassX = 0; biasCPassY = 0; biasCPassZ = 0;
+  }
 };
 
 
@@ -282,6 +295,15 @@ struct NavigationTarget {
         return GetDistanceToTarget(currentX, currentY) < arrivalThreshold;
     }
 };
+
+/***************************************************************************************
+ * Calcula distancia euclidiana entre dos puntos
+ ***************************************************************************************/
+inline float CalculateDistance(float x1, float y1, float x2, float y2) {
+    float dx = x2 - x1;
+    float dy = y2 - y1;
+    return sqrt(dx * dx + dy * dy);
+}
 
 
 /***************************************************************************************
@@ -680,14 +702,7 @@ inline float NormalizeAngle(float angle) {
     return angle;
 }
 
-/***************************************************************************************
- * Calcula distancia euclidiana entre dos puntos
- ***************************************************************************************/
-inline float CalculateDistance(float x1, float y1, float x2, float y2) {
-    float dx = x2 - x1;
-    float dy = y2 - y1;
-    return sqrt(dx * dx + dy * dy);
-}
+
 
 /***************************************************************************************
  * Calcula ángulo hacia un objetivo
