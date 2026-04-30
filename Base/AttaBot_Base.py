@@ -1,4 +1,6 @@
-import cv2, json, math, time, socket, threading, os, csv, multiprocessing, threading, platform
+import os
+os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')  # evita bloqueo de imshow en Wayland/Gnome
+import cv2, json, math, time, socket, threading, csv, multiprocessing, threading, platform
 import numpy as np
 import readline
 from datetime import datetime
@@ -314,7 +316,11 @@ class Base(object):
                 Retorna {} si no se detecta ningún marker.
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = self.arucoDetector.detectMarkers(gray)
+        # Detectar en media resolución (4x más rápido), escalar esquinas de vuelta
+        small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+        corners, ids, _ = self.arucoDetector.detectMarkers(small)
+        if corners:
+            corners = [c * 2.0 for c in corners]
 
         detectedPoses = {}
 
@@ -469,7 +475,9 @@ class Base(object):
             robotIP = self.setupMoveRobot(robotsIPs)
             isValidFrame = False
         else:
-            robotIP = self.setupRobotIP(robotsIPs, configuredRobots)
+            prevLen = len(robotsIPs)
+            self.setupRobotIP(robotsIPs, configuredRobots)
+            robotIP = None if len(robotsIPs) < prevLen else robotIP
             isValidFrame = True
 
         if len(robotsIPs) == 0:
@@ -669,8 +677,24 @@ class Base(object):
         self.cameraMatriz = np.loadtxt(configuration['path_cameraMatrix'], dtype=float)
         self.distance = np.loadtxt(configuration['path_distance'], dtype=float)
         h, w = self.cameraResolution
+
+        # La calibración se hizo a 1920x1080. Escalar la matriz si la resolución cambió.
+        calib_w, calib_h = 1920, 1080
+        sx, sy = w / calib_w, h / calib_h
+        if sx != 1.0 or sy != 1.0:
+            self.cameraMatriz = self.cameraMatriz.copy()
+            self.cameraMatriz[0, 0] *= sx  # fx
+            self.cameraMatriz[1, 1] *= sy  # fy
+            self.cameraMatriz[0, 2] *= sx  # cx
+            self.cameraMatriz[1, 2] *= sy  # cy
+            print(f'  Matriz de cámara escalada {calib_w}x{calib_h} → {w}x{h}')
+
         self.newCameraMatriz, self.roi = cv2.getOptimalNewCameraMatrix(
             self.cameraMatriz, self.distance, (w, h), 1, (w, h)
+        )
+        # Pre-computar mapas de corrección — remap es 3-5x más rápido que undistort
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(
+            self.cameraMatriz, self.distance, None, self.newCameraMatriz, (w, h), cv2.CV_16SC2
         )
 
         numerator, denominator = map(int, configuration['mmPixel'].split('/'))
@@ -688,15 +712,16 @@ class Base(object):
         arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         arucoParams = cv2.aruco.DetectorParameters()
 
-        # Parámetros para markers pequeños a distancia (2.5m+, markers ~30-47px)
         arucoParams.adaptiveThreshWinSizeMin = 3
-        arucoParams.adaptiveThreshWinSizeMax = 53    # más escalas para markers pequeños
-        arucoParams.adaptiveThreshWinSizeStep = 4    # paso fino: prueba 3,7,11...53 (13 escalas)
-        arucoParams.minMarkerPerimeterRate = 0.005   # ~6px perímetro mínimo en 1280px de ancho
+        arucoParams.adaptiveThreshWinSizeMax = 53    # 14 iteraciones (equilibrio velocidad/robustez)
+        arucoParams.adaptiveThreshWinSizeStep = 4
+        arucoParams.adaptiveThreshConstant = 5       # más sensible que default (7) en zonas oscuras
+        arucoParams.minMarkerPerimeterRate = 0.003
         arucoParams.maxMarkerPerimeterRate = 4.0
-        arucoParams.polygonalApproxAccuracyRate = 0.08  # más tolerante con bordes suaves
+        arucoParams.polygonalApproxAccuracyRate = 0.08
         arucoParams.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        arucoParams.errorCorrectionRate = 0.8        # más tolerancia a bits mal leídos
+        arucoParams.errorCorrectionRate = 0.9
+        arucoParams.perspectiveRemovePixelPerCell = 8
 
         self.arucoDetector = cv2.aruco.ArucoDetector(arucoDict, arucoParams)
         print(f'✓ Detector ArUco inicializado — DICT_4X4_50, marker: {self.markerSizeMm}mm')
@@ -743,8 +768,27 @@ class Base(object):
         self.debugResolution = tuple(map(int, configuration['debug_resolution'].split('x')))
         width, height = map(int, configuration['camera_resolution'].split('x'))
         self.cameraResolution = (height, width)
+
+        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # evita acumulación de frames viejos
+        # MJPEG permite 1080p @ 30 FPS por USB; sin esto V4L2 usa YUYV (~5 FPS)
+        self.camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.camera.set(cv2.CAP_PROP_FPS, 30)
+        # Fijar exposición para evitar parpadeo ("tweaking") bajo luz de laboratorio
+        self.camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)   # 1 = manual en V4L2
+        self.camera.set(cv2.CAP_PROP_EXPOSURE, 200)
+
+        actual_fps = self.camera.get(cv2.CAP_PROP_FPS)
+        actual_w   = int(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h   = int(self.camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f'✓ Cámara: {actual_w}x{actual_h} @ {actual_fps:.0f} FPS')
+
+        # Drena frames iniciales corruptos (MJPEG tarda ~30 frames en estabilizarse)
+        print('  Calentando cámara...', end='', flush=True)
+        for _ in range(30):
+            self.camera.read()
+        print(' listo')
 
         if not self.camera.isOpened():
             print(f'Error: No se pudo abrir la cámara {camera_index}.')
@@ -772,9 +816,7 @@ class Base(object):
         - frameGray (ndarray): Imagen en escala de grises (para uso interno).
         """
         x, y, w, h = self.roi
-        frame = cv2.undistort(
-            frame.copy(), self.cameraMatriz, self.distance, None, self.newCameraMatriz
-        )[y:y+h, x:x+w]
+        frame = cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)[y:y+h, x:x+w]
         frameGray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         return frame, frameGray
@@ -844,6 +886,8 @@ class Base(object):
         lastProcessedTime = time.time()
         lastStatusTime = time.time()
         executed = False
+        setupRetries = 0
+        MAX_SETUP_RETRIES = 15
 
         failCount = 0
 
@@ -891,6 +935,14 @@ class Base(object):
 
             elif len(robotsIPs) != 0:
                 robotIP, isValidFrame = self.setupRobots(robotIP, robotsIPs, configuredRobots)
+                if robotIP is not None:
+                    setupRetries += 1
+                    if setupRetries >= MAX_SETUP_RETRIES:
+                        print("[Setup] Timeout detectando desplazamiento, reintentando giro...")
+                        robotIP = None
+                        setupRetries = 0
+                else:
+                    setupRetries = 0
 
             else:
                 if not executed:
@@ -901,6 +953,10 @@ class Base(object):
 
                 timeLog = round((time.time() - self.startTime), 1)
                 processingStart = time.time()
+                if time.time() - lastStatusTime >= 2.0:
+                    lastStatusTime = time.time()
+                    for rid, (rx, ry, ra) in self.currentArucoDetections.items():
+                        print(f"[pos] Robot {rid}: x={rx:.1f}mm  y={ry:.1f}mm  angle={ra:.1f}°")
                 self.sendPositions(resultsFrame, timeLog)
                 self.addFrame(frame, resultsFrame, timeLog)
                 self.addTimeLog(timeLog, round(time.time() - processingStart, 4))
@@ -1023,6 +1079,7 @@ class Base(object):
         """Crea un archivo CSV de registro de tiempos de procesamiento."""
         currentTime = datetime.now().strftime(r'%d-%m_%H-%M')
         logName = f'Time_Log_{currentTime}_Robots_{self.numRobots}.csv'
+        os.makedirs('Logs', exist_ok=True)
         self.pathTimeLogs = os.path.join('Logs', logName)
         header = ['time', 'processingTime']
         with open(self.pathTimeLogs, 'w', newline='') as f:

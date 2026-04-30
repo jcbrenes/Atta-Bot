@@ -1,12 +1,12 @@
 {
         "vision_system": {
             "camera_index": 2,
-            "camera_resolution": "1920x1080",
+            "camera_resolution": "1280x720",
             "debug_resolution": "640x360",
             "path_cameraMatrix": "cameraMatrix.txt",
             "path_distance": "dist.txt",
             "mmPixel": "39/23",
-            "frame_processing_interval": 0.2,
+            "frame_processing_interval": 0.05,
             "marker_size_mm": 80
         },
         "udp_communication": {
@@ -16,7 +16,7 @@
             "network_interface": "enp3s0"
         },
         "general": {
-            "debug_enable": true,
+            "debug_enable": false,
             "path_save_videos": "Videos",
             "path_save_position_logs": "PositionLogs",
             "path_save_console_logs": "ConsoleLogs"
