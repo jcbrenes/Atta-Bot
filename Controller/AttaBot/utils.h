@@ -5,7 +5,7 @@
  * que no dependen directamente de hardware (motores, sensores, WiFi)
  * 
  * Proyecto: AttaBot - Sistema de Robot Enjambre
- * Autor: [Tu nombre]
+ * Autor: 
  * Fecha: 2025
  ***************************************************************************************/
 
@@ -331,12 +331,14 @@ struct Bug2State {
     
     // === Configuración ===
     bool isActive = false;
+    bool pendingInit = false;   // true entre BUG2 recibido y primer POSITION_RESPONSE
     float arrivalThreshold = 80;          // mm para considerar "llegó"
     float mLineThreshold = 60;            // mm de tolerancia para cruzar línea M
     int wallFollowDirection = 1;          // 1 = seguir pared derecha, -1 = izquierda
-    float wallFollowSegment = 120;        // mm por segmento de avance al seguir pared
-    float wallFollowTurnAngle = 45;       // grados por giro al seguir pared
-    
+    bool directionAutoSet = false;        // true cuando la dirección ya fue determinada
+    float wallFollowSegment = 200;        // mm por segmento de avance al seguir pared
+    float wallFollowTurnAngle = 30;       // grados por giro al seguir pared
+
     // === Detección de loops y timeout ===
     unsigned long navigationStartTime = 0;
     const unsigned long maxNavigationTime = 180000;  // 3 minutos máximo
@@ -346,6 +348,8 @@ struct Bug2State {
     const int maxWallFollowSteps = 100;              // Máximo antes de abortar
     const int minStepsBeforeLoopCheck = 8;           // Mín de pasos antes de verificar loop
     float loopThreshold = 100;                       // mm, si vuelve al hitPoint = loop
+    int lostWallSteps = 0;                           // Pasos consecutivos sin detectar pared
+    const int maxLostWallSteps = 6;                  // Máximo sin pared → volver a GOAL_SEEK
     
     // === Métodos ===
     
@@ -356,6 +360,7 @@ struct Bug2State {
         subState = GOAL_SEEK;
         navigationStartTime = millis();
         wallFollowSteps = 0;
+        lostWallSteps = 0;
         loopCheckSet = false;
         
         // Calcular coeficientes de la Línea M: Ax + By + C = 0
@@ -374,6 +379,7 @@ struct Bug2State {
     
     void Reset() {
         isActive = false;
+        pendingInit = false;
         subState = IDLE;
         startX = 0; startY = 0;
         goalX = 0;  goalY = 0;
@@ -381,8 +387,11 @@ struct Bug2State {
         hitDistanceToGoal = 0;
         lineA = 0; lineB = 0; lineC = 0;
         wallFollowSteps = 0;
+        lostWallSteps = 0;
         loopCheckSet = false;
         navigationStartTime = 0;
+        wallFollowDirection = 1;
+        directionAutoSet = false;
     }
     
     void RecordHitPoint(float x, float y) {
@@ -391,9 +400,11 @@ struct Bug2State {
         hitDistanceToGoal = CalculateDistance(x, y, goalX, goalY);
         subState = WALL_FOLLOW;
         wallFollowSteps = 0;
+        lostWallSteps = 0;
         loopCheckX = x;
         loopCheckY = y;
         loopCheckSet = true;
+        directionAutoSet = false;
     }
     
     // Distancia de un punto a la línea M

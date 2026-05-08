@@ -121,7 +121,7 @@ const float max_workspace_y = 2000;
 // Filtro de saltos bruscos en actualización de pose
 const float max_pose_jump =
     500; // Máximo salto permitido en mm por actualización
-const float max_angle_jump = 90; // Máximo salto permitido en grados
+const float max_angle_jump = 179; // Máximo salto permitido en grados
 
 // IMU
 const float gravity = 9806.65;
@@ -773,6 +773,7 @@ void loop() {
                       robotID.c_str());
       } else {
         navTarget.Reset();
+        bug2.Reset();  // limpia pendingInit si el timeout fue del arranque de Bug2
       }
 
       state = WAIT;
@@ -807,6 +808,35 @@ void loop() {
                     "Re-escaneando.",
                     robotID.c_str(), timeSinceDetection);
       state = STOP;
+      break;
+    }
+
+    // Bug2: limpiar evasión y dejar que Bug2WallFollowStep maneje el obstáculo
+    if (bug2.isActive) {
+      if (bug2.subState == Bug2State::GOAL_SEEK) {
+        bug2.RecordHitPoint(robotPose.x, robotPose.y);
+        MessageDebugf(
+            "DEBUG: -1, ID: %s, Bug2: obstáculo en GOAL_SEEK -> RecordHitPoint "
+            "(%.1f,%.1f), cambiando a WALL_FOLLOW",
+            robotID.c_str(), robotPose.x, robotPose.y);
+      } else {
+        MessageDebugf("DEBUG: -1, ID: %s, Bug2: obstáculo en WALL_FOLLOW, "
+                      "re-evaluando",
+                      robotID.c_str());
+      }
+
+      instructionList.clear();
+      obstacleDetected = false;
+      isEvading = false;
+      resumeScheduled = false;
+      intContext.Clear();
+      // No limpiar obstacles: Bug2WallFollowStep necesita el estado actual de sensores
+
+      fsmInstruction[0] = BUG2_REQUEST_POSITION;
+      fsmInstruction[1] = 0;
+      instructionList.push_back(fsmInstruction);
+
+      state = READ_INSTRUCTION;
       break;
     }
 
@@ -1341,10 +1371,6 @@ void Bug2ProcessPosition() {
 }
 
 void Bug2WallFollowStep() {
-  // Paso de seguimiento de pared usando sensores IR
-  // Estrategia: seguir pared derecha (wallFollowDirection = 1)
-  // Se genera un giro + avance corto según lo que detecten los sensores
-
   float turnAngle = 0;
   float moveDistance = bug2.wallFollowSegment;
 
@@ -1354,30 +1380,55 @@ void Bug2WallFollowStep() {
   bool rightBlocked = obstacles.rightObstacle;
   bool leftBlocked = obstacles.leftObstacle;
 
+  // Determinar dirección de rodeo en el primer paso si no fue asignada por comando
+  if (!bug2.directionAutoSet) {
+    if (rightBlocked && !leftBlocked) {
+      bug2.wallFollowDirection = 1;
+    } else if (leftBlocked && !rightBlocked) {
+      bug2.wallFollowDirection = -1;
+    }
+    // Si frontal o ambos lados: mantener dirección actual (default 1)
+    bug2.directionAutoSet = true;
+    MessageDebugf("DEBUG: -1, ID: %s, Bug2 WF: dirección auto=%d (L=%d,C=%d,R=%d)",
+                  robotID.c_str(), bug2.wallFollowDirection,
+                  (int)leftBlocked, (int)frontBlocked, (int)rightBlocked);
+  }
+
   if (frontBlocked) {
-    // Pared enfrente: girar a la izquierda (alejarse de la pared derecha)
+    bug2.lostWallSteps = 0;
     turnAngle = -90 * bug2.wallFollowDirection;
-    moveDistance = 0; // Solo girar
+    moveDistance = 0;
     MessageDebugf("DEBUG: -1, ID: %s, Bug2 WF: Pared frontal -> Girar %.0f°",
                   robotID.c_str(), turnAngle);
   } else if (rightBlocked && bug2.wallFollowDirection == 1) {
-    // Pared a la derecha y siguiendo pared derecha: avanzar paralelo
+    bug2.lostWallSteps = 0;
     turnAngle = 0;
     MessageDebugf(
         "DEBUG: -1, ID: %s, Bug2 WF: Pared derecha -> Avanzar paralelo",
         robotID.c_str());
   } else if (leftBlocked && bug2.wallFollowDirection == -1) {
-    // Pared a la izquierda y siguiendo pared izquierda: avanzar paralelo
+    bug2.lostWallSteps = 0;
     turnAngle = 0;
     MessageDebugf(
         "DEBUG: -1, ID: %s, Bug2 WF: Pared izquierda -> Avanzar paralelo",
         robotID.c_str());
   } else {
-    // Perdió la pared: girar hacia ella para recuperarla
+    bug2.lostWallSteps++;
+    if (bug2.lostWallSteps >= bug2.maxLostWallSteps) {
+      MessageDebugf(
+          "DEBUG: -1, ID: %s, Bug2 WF: Sin pared por %d pasos -> GOAL_SEEK",
+          robotID.c_str(), bug2.lostWallSteps);
+      bug2.lostWallSteps = 0;
+      bug2.subState = Bug2State::GOAL_SEEK;
+      fsmInstruction[0] = BUG2_REQUEST_POSITION;
+      fsmInstruction[1] = 0;
+      instructionList.push_back(fsmInstruction);
+      return;
+    }
     turnAngle = bug2.wallFollowTurnAngle * bug2.wallFollowDirection;
     MessageDebugf(
-        "DEBUG: -1, ID: %s, Bug2 WF: Sin pared -> Girar %.0f° para buscar",
-        robotID.c_str(), turnAngle);
+        "DEBUG: -1, ID: %s, Bug2 WF: Sin pared (%d/%d) -> Girar %.0f°",
+        robotID.c_str(), bug2.lostWallSteps, bug2.maxLostWallSteps, turnAngle);
   }
 
   // Encolar giro si necesario
@@ -2103,6 +2154,7 @@ void ReadUdpPackets() {
       int dir = arguments[3].toInt();
       if (dir == -1 || dir == 1) {
         bug2.wallFollowDirection = dir;
+        bug2.directionAutoSet = true;  // No sobreescribir con auto-detect
       }
     }
 
@@ -2118,7 +2170,8 @@ void ReadUdpPackets() {
     // Guardar objetivo para iniciar después de recibir posición
     bug2.goalX = targetX;
     bug2.goalY = targetY;
-    bug2.isActive = false; // Se activará cuando llegue POSITION_RESPONSE
+    bug2.isActive = false;
+    bug2.pendingInit = true;
   }
 
   // POSITION_RESPONSE
@@ -2145,8 +2198,8 @@ void ReadUdpPackets() {
 
     if (bug2.isActive) {
       Bug2ProcessPosition();
-    } else if (bug2.goalX != 0 || bug2.goalY != 0) {
-      // Bug2 recién configurado, iniciar navegación ahora que tenemos posición
+    } else if (bug2.pendingInit) {
+      bug2.pendingInit = false;
       InitiateBug2Navigation(bug2.goalX, bug2.goalY);
     } else if (navTarget.isActive) {
       CalculateIterativeMovement();
