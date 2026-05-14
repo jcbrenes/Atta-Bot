@@ -3,7 +3,7 @@ import threading
 import os
 
 # Configuración
-BIN = "/home/thrain/Atta-Bot-P_ed/Controller/AttaBot/build/esp32.esp32.esp32/AttaBot.ino.bin"   # nombre del binario compilado
+BIN = "/home/thrain/Documents/Atta-Bot-P_ed/Controller/AttaBot/build/esp32.esp32.esp32/AttaBot.ino.bin"
 PORT = 3232            # puerto OTA (ArduinoOTA usa 3232 por defecto)
 PASS = "attabot1234"              # password si usaste ArduinoOTA.setPassword()
 
@@ -20,7 +20,7 @@ IPS = [
 ]
 
 # Ruta a espota.py (ajústala si tu instalación es diferente)
-ESPOTA = os.path.expanduser("/home/thrain/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/espota.py")
+ESPOTA = os.path.expanduser("/home/thrain/.arduino15/packages/esp32/hardware/esp32/3.3.7/tools/espota.py")
 
 def upload(ip):
     print(f"🚀 Subiendo firmware a {ip} ...")
