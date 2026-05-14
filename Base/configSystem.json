@@ -7,7 +7,9 @@
             "path_distance": "dist.txt",
             "mmPixel": "39/23",
             "frame_processing_interval": 0.05,
-            "marker_size_mm": 80
+            "marker_size_mm": 80,
+            "origin_x_mm": -1496.6,
+            "origin_y_mm": -840.8
         },
         "udp_communication": {
             "base_ip": "192.168.1.100",
@@ -16,7 +18,7 @@
             "network_interface": "enp3s0"
         },
         "general": {
-            "debug_enable": false,
+            "debug_enable": true,
             "path_save_videos": "Videos",
             "path_save_position_logs": "PositionLogs",
             "path_save_console_logs": "ConsoleLogs"

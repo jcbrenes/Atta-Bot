@@ -351,9 +351,9 @@ class Base(object):
             if not success:
                 continue
 
-            # Posición en mm (tvec está en metros)
-            x_mm = round(float(tvec[0][0]) * 1000.0, 1)
-            y_mm = round(float(tvec[1][0]) * 1000.0, 1)
+            # Posición en mm (tvec está en metros), relativa al origen configurado
+            x_mm = round(float(tvec[0][0]) * 1000.0 - self.originXmm, 1)
+            y_mm = round(float(tvec[1][0]) * 1000.0 - self.originYmm, 1)
 
             # Ángulo: extraer heading del eje X del marker proyectado en el plano XY
             rotMatrix, _ = cv2.Rodrigues(rvec)
@@ -703,6 +703,8 @@ class Base(object):
 
         # Tamaño físico del marker en mm (recomendado: 80mm+ a 2.5m de distancia)
         self.markerSizeMm = float(configuration['marker_size_mm'])
+        self.originXmm = float(configuration.get('origin_x_mm', 0))
+        self.originYmm = float(configuration.get('origin_y_mm', 0))
 
         # Radio visual para el resultsFrame (proporcional al tamaño del marker en px)
         self.bigCircleRadius = max(6, int((self.markerSizeMm / self.mmPixel) * 0.5))
@@ -955,8 +957,6 @@ class Base(object):
                 processingStart = time.time()
                 if time.time() - lastStatusTime >= 2.0:
                     lastStatusTime = time.time()
-                    for rid, (rx, ry, ra) in self.currentArucoDetections.items():
-                        print(f"[pos] Robot {rid}: x={rx:.1f}mm  y={ry:.1f}mm  angle={ra:.1f}°")
                 self.sendPositions(resultsFrame, timeLog)
                 self.addFrame(frame, resultsFrame, timeLog)
                 self.addTimeLog(timeLog, round(time.time() - processingStart, 4))
@@ -1218,6 +1218,12 @@ class Base(object):
                 if command == 'REQUEST_POSITION':
                     if robotFound:
                         self.sendPositionToRobot(ip, id)
+                    if len(parts) >= 5 and parts[1] == 'BUG2':
+                        b_state = parts[2]
+                        b_steps = parts[3]
+                        b_dist  = parts[4]
+                        print(f"[Bug2 {b_state} paso={b_steps} dist={b_dist}mm] {name}")
+                    else:
                         print(f"Solicitud de posición de {name}")
 
                 elif command == 'LEADER_POSITION':
@@ -1404,13 +1410,16 @@ class Base(object):
                 else:
                     print("Formato: GOTO.robotID x y")
             elif robotId == 'STATUS':
+                print(f"Detecciones ArUco activas: {list(self.currentArucoDetections.keys())}")
+                for rid, robot in self.robots.items():
+                    x, y, angle = robot.getPose()
+                    if x != -1:
+                        print(f"  Robot {rid} ({robot.name}): x={x}, y={y}, angle={angle}°")
+                    else:
+                        print(f"  Robot {rid} ({robot.name}): no visible")
                 if self.congregationActive:
                     print(f"Congregación activa. Líder: {self.leaderID}")
                     print(f"Completa: {self.isCongregationComplete()}")
-                    print(f"Detecciones ArUco activas: {list(self.currentArucoDetections.keys())}")
-                else:
-                    print("No hay congregación activa")
-                    print(f"Detecciones ArUco activas: {list(self.currentArucoDetections.keys())}")
             else:
                 print(f"Robot ID '{robotId}' no encontrado.")
 
