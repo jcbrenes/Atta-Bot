@@ -1080,9 +1080,14 @@ void loop() {
     }
 
     if (!congregation.waitingForResponse) {
-      SendMessage(robots["Base"], "REQUEST_POSITION");
-      MessageDebugf("DEBUG: -1, ID: %s, Bug2: Solicitud de posición enviada",
-                    robotID.c_str());
+      char bug2Msg[96];
+      const char *subStateStr =
+          (bug2.subState == Bug2State::GOAL_SEEK) ? "SEEK" : "WALL";
+      float distToGoal = CalculateDistance(robotPose.x, robotPose.y,
+                                           bug2.goalX, bug2.goalY);
+      snprintf(bug2Msg, sizeof(bug2Msg), "REQUEST_POSITION|BUG2|%s|%d|%.0f",
+               subStateStr, bug2.wallFollowSteps, distToGoal);
+      SendMessage(robots["Base"], bug2Msg);
       congregation.StartRequest();
     }
 

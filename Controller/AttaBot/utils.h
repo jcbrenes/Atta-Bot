@@ -333,7 +333,7 @@ struct Bug2State {
     bool isActive = false;
     bool pendingInit = false;   // true entre BUG2 recibido y primer POSITION_RESPONSE
     float arrivalThreshold = 80;          // mm para considerar "llegó"
-    float mLineThreshold = 60;            // mm de tolerancia para cruzar línea M
+    float mLineThreshold = 150;           // mm de tolerancia para cruzar línea M
     int wallFollowDirection = 1;          // 1 = seguir pared derecha, -1 = izquierda
     bool directionAutoSet = false;        // true cuando la dirección ya fue determinada
     float wallFollowSegment = 200;        // mm por segmento de avance al seguir pared
@@ -349,7 +349,7 @@ struct Bug2State {
     const int minStepsBeforeLoopCheck = 8;           // Mín de pasos antes de verificar loop
     float loopThreshold = 100;                       // mm, si vuelve al hitPoint = loop
     int lostWallSteps = 0;                           // Pasos consecutivos sin detectar pared
-    const int maxLostWallSteps = 6;                  // Máximo sin pared → volver a GOAL_SEEK
+    const int maxLostWallSteps = 3;                  // Máximo sin pared → volver a GOAL_SEEK
     
     // === Métodos ===
     
@@ -423,10 +423,24 @@ struct Bug2State {
         return currentDist < (hitDistanceToGoal - arrivalThreshold * 0.5);
     }
     
-    // Condición Bug 2 para dejar de seguir pared
+    // Condición Bug 2 para dejar de seguir pared.
+    // La proyección sobre la línea M reemplaza al guard de minStepsBeforeLoopCheck:
+    // el robot debe estar 100mm+ adelante del hitPoint en la dirección Start→Goal.
+    // Esto permite salir antes en obstáculos pequeños (<8 pasos) sin salir
+    // prematuramente en el hitPoint mismo (donde currProj ≈ hitProj).
     bool ShouldLeaveWall(float x, float y) {
-        if (wallFollowSteps < minStepsBeforeLoopCheck) return false;
-        return IsOnMLine(x, y) && IsCloserThanHitPoint(x, y);
+        if (!IsOnMLine(x, y)) return false;
+        if (!IsCloserThanHitPoint(x, y)) return false;
+
+        float dx = goalX - startX;
+        float dy = goalY - startY;
+        float len = sqrt(dx * dx + dy * dy);
+        if (len < 1.0f) return false;
+        dx /= len;
+        dy /= len;
+        float hitProj  = (hitX - startX) * dx + (hitY - startY) * dy;
+        float currProj = (x   - startX) * dx + (y   - startY) * dy;
+        return currProj > hitProj + 100.0f;
     }
     
     bool HasReachedGoal(float x, float y) {
