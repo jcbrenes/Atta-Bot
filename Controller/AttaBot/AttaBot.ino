@@ -2448,7 +2448,9 @@ void ReadUdpPackets() {
     congregation.positionReceived = false;
     congregation.hasGlobalTarget = false;
 
+    nav.Reset();
     navTarget.Reset();
+    instructionList.clear();
 
     MessageDebugf("DEBUG: -1, ID: %s, Congregación iniciada. Líder: %s",
                   robotID.c_str(), congregation.leaderID.c_str());
@@ -2629,17 +2631,15 @@ void ReadUdpPackets() {
     char buffer[250];
     snprintf(
         buffer, sizeof(buffer),
-        "STATUS|ID:%s|State:%d|GT:%d|Evading:%d|Obs:%d|"
+        "STATUS|ID:%s|State:%d|NAV:%d|Evading:%d|Obs:%d|"
         "Sensors:L%d-C%d-R%d|Pos:(%.1f,%.1f,%.1f)|"
-        "Goal:(%.1f,%.1f)|Sub:%s|Steps:%d|Yaw:%.1f|IMU:%d",
-        robotID.c_str(), state, (int)bug2.isActive, (int)isEvading,
+        "Goal:(%.1f,%.1f)|Yaw:%.1f|IMU:%d",
+        robotID.c_str(), state, (int)nav.isActive, (int)isEvading,
         (int)obstacles.HasAnyObstacle(), (int)obstacles.leftObstacle,
         (int)obstacles.centralObstacle, (int)obstacles.rightObstacle,
         robotPose.x, robotPose.y, robotPose.angle,
-        bug2.goalX, bug2.goalY,
-        (bug2.subState == Bug2State::GOAL_SEEK) ? "SEEK" :
-        (bug2.subState == Bug2State::WALL_FOLLOW) ? "WALL" : "IDLE",
-        bug2.wallFollowSteps, yaw, (int)imuAvailable);
+        nav.goalX, nav.goalY,
+        yaw, (int)imuAvailable);
     SendMessage(robots["Base"], buffer);
   }
 
