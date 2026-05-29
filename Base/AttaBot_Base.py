@@ -1,9 +1,12 @@
 import os
-os.environ.setdefault('QT_QPA_PLATFORM', 'xcb')  # evita bloqueo de imshow en Wayland/Gnome
+os.environ['QT_QPA_PLATFORM'] = 'xcb'  # forzar xcb — cv2 no tiene plugin wayland
 import cv2, json, math, time, socket, threading, csv, multiprocessing, threading, platform
 import numpy as np
 import readline
 from datetime import datetime
+
+# GUI opcional — se usa cuando se llama vía AttaBot_GUI.launch()
+_gui_instance = None
 
 
 def runOnThread(func):
@@ -32,6 +35,17 @@ def runOnThread(func):
         return thread
 
     return wrapper
+
+
+# Colores BGR por ID de robot para el mapa de cobertura
+_ROBOT_COLORS_BGR = [
+    (220,  70,  30),  # 0: azul
+    ( 30, 180,  30),  # 1: verde
+    ( 30,  30, 210),  # 2: rojo
+    (190,  40, 190),  # 3: magenta
+    ( 20, 190, 190),  # 4: amarillo
+    ( 20, 130, 220),  # 5: naranja
+]
 
 
 def videoWriter(frameResolution, numRobots, pathVideo, processInterval, queue, debugResolution):
@@ -70,16 +84,9 @@ def videoWriter(frameResolution, numRobots, pathVideo, processInterval, queue, d
 
         frame, resultsFrame = frames
 
-        resizeResultFrame = cv2.resize(resultsFrame, debugResolution, interpolation=cv2.INTER_AREA)
-        resizeFrame = cv2.resize(frame, debugResolution, interpolation=cv2.INTER_AREA)
-        resizeResults = cv2.vconcat([resizeFrame, resizeResultFrame])
-        cv2.imshow('Recorrido robots', resizeResults)
-
+        # Solo grabación — el display lo maneja la GUI o el proceso principal
         results = cv2.vconcat([frame, resultsFrame])
         video.write(results)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
 
     video.release()
 
@@ -138,6 +145,9 @@ class Robot(object):
             configRobot (dict): Diccionario de configuración de los robots.
         """
         self.name = configRobot[self.id]['name']
+        self.angleOffset = float(configRobot[self.id].get('angle_offset', 0.0))
+        wd = configRobot[self.id].get('wheel_distance')
+        self.wheelDistance = float(wd) if wd is not None else None
         self.previousPose = self.getPose()
 
 
@@ -189,7 +199,7 @@ class Robot(object):
             a2 (float): El ángulo final en grados.
 
         Returns:
-            float: El desplazamiento angular en grados, redondeado a un decimal.
+            float: El desplazamiento angular en grados, re1dondeado a un decimal.
         """
         angularDisplacement = a2 - a1
         if angularDisplacement > 180:
@@ -234,7 +244,10 @@ class Robot(object):
             ip (str): La dirección IP que se asignará al robot.
         """
         self.IP = ip
-        base.sendInstruction(ip, [f'CONFIG|{self.id}'], False)
+        instructions = [f'CONFIG|{self.id}']
+        if self.wheelDistance is not None:
+            instructions.append(f'NAV_CONFIG|WHEEL_DIST|{self.wheelDistance}')
+        base.sendInstruction(ip, instructions, False)
 
 
 
@@ -288,8 +301,23 @@ class Base(object):
         # --- ArUco ---
         self.arucoDetector = None
         self.markerSizeMm = 80.0          # valor por defecto, sobreescrito desde JSON
-        self.currentArucoDetections = {}  # {robot_id: (x_mm, y_mm, angle_deg)}
+        self.currentArucoDetections = {}    # raw: {robot_id: (x_mm, y_mm, angle_deg)}
+        self._smoothedArucoDetections = {} # EMA-suavizado, solo para enviar posiciones al robot
+        self._arucoEma = {}               # estado interno del EMA
+        self.arucoEmaAlpha = 0.4          # peso del frame nuevo (0=sin cambio, 1=sin suavizado)
         self.bigCircleRadius = 10         # radio visual en el resultsFrame (px)
+        self.cellSizeMm = 50.0            # tamaño de celda del mapa de cobertura en mm
+        self.coverageGrid = None          # grilla de cobertura: -1=libre, else robot_id
+        self.cellPx = 1                   # tamaño de celda en píxeles
+        self.gui = None                   # referencia a AttaBotGUI (None = modo terminal)
+
+
+    def log(self, msg: str):
+        """Muestra un mensaje en el log de la GUI o en la terminal si no hay GUI."""
+        if self.gui is not None:
+            self.gui.logSignal.emit(msg)
+        else:
+            print(msg)
 
 
     # =========================================================================
@@ -316,11 +344,9 @@ class Base(object):
                 Retorna {} si no se detecta ningún marker.
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # Detectar en media resolución (4x más rápido), escalar esquinas de vuelta
-        small = cv2.resize(gray, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        corners, ids, _ = self.arucoDetector.detectMarkers(small)
-        if corners:
-            corners = [c * 2.0 for c in corners]
+        # Detección a resolución completa: a 2.5m de altura el marker de 80mm ocupa
+        # solo ~47px — a media resolución baja a ~24px (3.9px/celda), límite de fallo.
+        corners, ids, _ = self.arucoDetector.detectMarkers(gray)
 
         detectedPoses = {}
 
@@ -337,30 +363,43 @@ class Base(object):
             [-halfSize, -halfSize, 0.0]
         ], dtype=np.float32)
 
+        # Paso 1: resolver pose de todos los markers y buscar el de referencia
+        rawPositions = {}  # {str(id): (raw_x_mm, raw_y_mm, angle_deg)}
         for i, marker_id in enumerate(ids.flatten()):
             imagePoints = corners[i][0].astype(np.float32)
-
             success, rvec, tvec = cv2.solvePnP(
-                objectPoints,
-                imagePoints,
-                self.cameraMatriz,
-                self.distance,
+                objectPoints, imagePoints,
+                self.cameraMatriz, self.distance,
                 flags=cv2.SOLVEPNP_IPPE_SQUARE
             )
-
             if not success:
                 continue
-
-            # Posición en mm (tvec está en metros), relativa al origen configurado
-            x_mm = round(float(tvec[0][0]) * 1000.0 - self.originXmm, 1)
-            y_mm = round(float(tvec[1][0]) * 1000.0 - self.originYmm, 1)
-
-            # Ángulo: extraer heading del eje X del marker proyectado en el plano XY
+            raw_x = float(tvec[0][0]) * 1000.0
+            raw_y = float(tvec[1][0]) * 1000.0
             rotMatrix, _ = cv2.Rodrigues(rvec)
             angle_rad = np.arctan2(rotMatrix[1][0], rotMatrix[0][0])
             angle_deg = round(float(np.degrees(angle_rad) % 360), 1)
+            rawPositions[str(marker_id)] = (raw_x, raw_y, angle_deg)
 
-            detectedPoses[str(marker_id)] = (x_mm, y_mm, angle_deg)
+        # Paso 2: si hay marker de referencia visible, anclar origen a él
+        if self.referenceMarkerId and self.referenceMarkerId in rawPositions:
+            ref_x, ref_y, _ = rawPositions[self.referenceMarkerId]
+            self.originXmm = round(ref_x, 1)
+            self.originYmm = round(ref_y, 1)
+
+        # Paso 3: calcular poses relativas al origen
+        for marker_id_str, (raw_x, raw_y, angle_deg) in rawPositions.items():
+            if marker_id_str == self.referenceMarkerId:
+                detectedPoses[marker_id_str] = (0.0, 0.0, angle_deg)
+                continue
+            x_mm = round(raw_x - self.originXmm, 1)
+            y_mm = round(raw_y - self.originYmm, 1)
+            # Aplicar offset de ángulo por robot (compensa marker montado rotado)
+            offset = 0.0
+            if marker_id_str in self.robots:
+                offset = self.robots[marker_id_str].angleOffset
+            corrected_angle = round((angle_deg + offset) % 360, 1)
+            detectedPoses[marker_id_str] = (x_mm, y_mm, corrected_angle)
 
         return detectedPoses
 
@@ -453,6 +492,8 @@ class Base(object):
         - foundRobots (set): IDs de robots detectados visualmente.
         """
         self.robots = {robot: Robot(robot, self.robotsConfig) for robot in sorted(foundRobots, key=int)}
+        if self.gui is not None:
+            self.gui.refreshRobots()
 
 
     def setupRobots(self, robotIP, robotsIPs, configuredRobots):
@@ -705,6 +746,10 @@ class Base(object):
         self.markerSizeMm = float(configuration['marker_size_mm'])
         self.originXmm = float(configuration.get('origin_x_mm', 0))
         self.originYmm = float(configuration.get('origin_y_mm', 0))
+        # ID del marker fijo de referencia que ancla el origen del escenario.
+        # Si está presente en el frame, el sistema lo usa como (0,0) automáticamente.
+        ref = configuration.get('reference_marker_id', '')
+        self.referenceMarkerId = str(ref) if ref != '' else None
 
         # Radio visual para el resultsFrame (proporcional al tamaño del marker en px)
         self.bigCircleRadius = max(6, int((self.markerSizeMm / self.mmPixel) * 0.5))
@@ -714,13 +759,15 @@ class Base(object):
         arucoDict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         arucoParams = cv2.aruco.DetectorParameters()
 
+        # A 2.5m de altura los markers de 80mm miden ~47px a resolución completa.
+        # WinSize: ventana adaptativa relativa al tamaño del marker — mín 3, máx ~marker/2
         arucoParams.adaptiveThreshWinSizeMin = 3
-        arucoParams.adaptiveThreshWinSizeMax = 53    # 14 iteraciones (equilibrio velocidad/robustez)
+        arucoParams.adaptiveThreshWinSizeMax = 23    # ~marker/2; antes era 53 (para media-res)
         arucoParams.adaptiveThreshWinSizeStep = 4
-        arucoParams.adaptiveThreshConstant = 5       # más sensible que default (7) en zonas oscuras
-        arucoParams.minMarkerPerimeterRate = 0.003
+        arucoParams.adaptiveThreshConstant = 7       # default; con full-res hay más señal
+        arucoParams.minMarkerPerimeterRate = 0.02    # 47px perím. / 1280px ancho ≈ 0.037 — margen
         arucoParams.maxMarkerPerimeterRate = 4.0
-        arucoParams.polygonalApproxAccuracyRate = 0.08
+        arucoParams.polygonalApproxAccuracyRate = 0.05
         arucoParams.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         arucoParams.errorCorrectionRate = 0.9
         arucoParams.perspectiveRemovePixelPerCell = 8
@@ -806,6 +853,26 @@ class Base(object):
     # PROCESAMIENTO DE FRAMES
     # =========================================================================
 
+    def _applyArucoEma(self, raw):
+        alpha = self.arucoEmaAlpha
+        smoothed = {}
+        for rid, (x, y, angle) in raw.items():
+            if rid not in self._arucoEma:
+                self._arucoEma[rid] = (x, y, angle)
+            ex, ey, ea = self._arucoEma[rid]
+            nx = alpha * x + (1 - alpha) * ex
+            ny = alpha * y + (1 - alpha) * ey
+            # ángulo: EMA sobre diferencia normalizada para evitar salto 0/360
+            diff = ((angle - ea) + 180) % 360 - 180
+            na = (ea + alpha * diff) % 360
+            self._arucoEma[rid] = (nx, ny, na)
+            smoothed[rid] = (round(nx, 1), round(ny, 1), round(na, 1))
+        # limpiar EMA de markers que dejaron de verse
+        for rid in list(self._arucoEma):
+            if rid not in raw:
+                del self._arucoEma[rid]
+        return smoothed
+
     def cameraCorrection(self, frame):
         """
         Desdistorsiona y recorta la imagen de la cámara.
@@ -841,8 +908,10 @@ class Base(object):
         """
         frame, frameGray = self.cameraCorrection(frame)
 
-        # Detección ArUco — actualiza el diccionario accedido por Robot.getPose()
-        self.currentArucoDetections = self.detectArucoMarkers(frame)
+        # Detección ArUco — raw para desplazamiento/setup, suavizado para navegación
+        raw = self.detectArucoMarkers(frame)
+        self.currentArucoDetections = raw
+        self._smoothedArucoDetections = self._applyArucoEma(raw)
 
         if self.debug:
             self.cameraDebug(frame)
@@ -859,6 +928,8 @@ class Base(object):
         Parámetros:
         - frame (ndarray): Frame BGR ya corregido.
         """
+        if self.gui is not None:
+            return  # GUI recibe frames via frameSignal; no se necesita ventana separada
         debugFrame = self.drawArucoDebug(frame.copy())
         resized = cv2.resize(debugFrame, self.debugResolution, interpolation=cv2.INTER_AREA)
         cv2.imshow('Debug ArUco', resized)
@@ -978,13 +1049,14 @@ class Base(object):
             displacement = robot.getDisplacement()
             if displacement is not None:
                 x, y, angle = robot.previousPose
-                self.createCircle(resultsFrame, x, y)
+                self._paintCoverage(resultsFrame, robot.id, x, y)
 
                 instruction = f'POSE|{x}|{y}|{angle}'
                 self.sendInstruction(robot.IP, [instruction], False)
 
                 self.addPositionLog(timeLog, robot.id, robot.name,
                                     robot.previousPose, displacement)
+        self._drawLegend(resultsFrame)
 
 
     def initializeVideoAndLogging(self, resolution):
@@ -999,6 +1071,17 @@ class Base(object):
         """
         h, w = resolution
         resultsFrame = np.full((h, w, 3), (255, 255, 255), dtype=np.uint8)
+
+        self.cellPx = max(4, int(self.cellSizeMm / self.mmPixel))
+        grid_h = (h + self.cellPx - 1) // self.cellPx
+        grid_w = (w + self.cellPx - 1) // self.cellPx
+        self.coverageGrid = np.full((grid_h, grid_w), -1, dtype=np.int8)
+
+        # Dibujar líneas de grilla tenues para visualizar la cuadrícula vacía
+        for gx in range(0, w, self.cellPx):
+            cv2.line(resultsFrame, (gx, 0), (gx, h - 1), (220, 220, 220), 1)
+        for gy in range(0, h, self.cellPx):
+            cv2.line(resultsFrame, (0, gy), (w - 1, gy), (220, 220, 220), 1)
 
         self.frameQueue = multiprocessing.Queue()
         args = (
@@ -1017,8 +1100,9 @@ class Base(object):
 
         for robot in self.robots.values():
             x, y, _ = robot.previousPose
-            self.createCircle(resultsFrame, x, y)
+            self._paintCoverage(resultsFrame, robot.id, x, y)
             self.addPositionLog(0, robot.id, robot.name, robot.previousPose, (0, 0))
+        self._drawLegend(resultsFrame)
 
         self.inputInstruction()
         self.readUdpConnection()
@@ -1026,18 +1110,48 @@ class Base(object):
         return True, resultsFrame
 
 
-    def createCircle(self, resultsFrame, x, y):
-        """
-        Dibuja un círculo en el frame de resultados representando la posición de un robot.
+    def _robotColor(self, robot_id):
+        """Retorna el color BGR asignado al robot según su ID."""
+        return _ROBOT_COLORS_BGR[int(robot_id) % len(_ROBOT_COLORS_BGR)]
 
-        Parámetros:
-        - resultsFrame (ndarray): Frame de resultados.
-        - x (float): Coordenada x en mm.
-        - y (float): Coordenada y en mm.
+    def _paintCoverage(self, resultsFrame, robot_id, x_mm, y_mm):
         """
-        printX = int(x / self.mmPixel)
-        printY = int(y / self.mmPixel)
-        cv2.circle(resultsFrame, [printX, printY], self.bigCircleRadius, (255, 0, 0), -1)
+        Marca la celda de la grilla de cobertura que corresponde a (x_mm, y_mm)
+        y la pinta con el color del robot. Si la celda ya pertenece a este robot,
+        no hace nada (evita redibujados innecesarios).
+        Coordenadas fuera de la grilla se ignoran silenciosamente.
+        """
+        if self.coverageGrid is None:
+            return
+        cell_x = int(x_mm / self.cellSizeMm)
+        cell_y = int(y_mm / self.cellSizeMm)
+        gh, gw = self.coverageGrid.shape
+        if not (0 <= cell_x < gw and 0 <= cell_y < gh):
+            return
+        robot_idx = int(robot_id)
+        if self.coverageGrid[cell_y, cell_x] == robot_idx:
+            return
+        self.coverageGrid[cell_y, cell_x] = robot_idx
+        color = self._robotColor(robot_id)
+        px0, py0 = cell_x * self.cellPx, cell_y * self.cellPx
+        px1 = min(px0 + self.cellPx, resultsFrame.shape[1])
+        py1 = min(py0 + self.cellPx, resultsFrame.shape[0])
+        cv2.rectangle(resultsFrame, (px0, py0), (px1 - 1, py1 - 1), color, -1)
+        cv2.rectangle(resultsFrame, (px0, py0), (px1 - 1, py1 - 1), (180, 180, 180), 1)
+
+    def _drawLegend(self, resultsFrame):
+        """Dibuja la leyenda de colores por robot en la esquina superior derecha del mapa."""
+        patch, gap, margin = 18, 4, 8
+        x0 = resultsFrame.shape[1] - 130
+        y0 = margin
+        for robot in self.robots.values():
+            color = self._robotColor(robot.id)
+            cv2.rectangle(resultsFrame, (x0, y0), (x0 + patch, y0 + patch), color, -1)
+            cv2.rectangle(resultsFrame, (x0, y0), (x0 + patch, y0 + patch), (60, 60, 60), 1)
+            label = f'R{robot.id}: {robot.name[:7]}'
+            cv2.putText(resultsFrame, label, (x0 + patch + 4, y0 + patch - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (30, 30, 30), 1)
+            y0 += patch + gap
 
 
     def cleanup(self):
@@ -1065,10 +1179,13 @@ class Base(object):
         - resultsFrame (ndarray): Frame de resultados.
         - timeLog (float): Tiempo transcurrido en segundos.
         """
-        text = f'Time: {timeLog} s'
-        position = (2, 26)
-        cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 200), 1, cv2.LINE_AA)
-        self.frameQueue.put([frame, resultsFrame])
+        cv2.putText(frame, f'Time: {timeLog} s', (2, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 200, 200), 1, cv2.LINE_AA)
+        # Enviar a la GUI si está disponible; siempre encolar para grabación en disco
+        if self.gui is not None:
+            self.gui.frameSignal.emit(frame.copy(), resultsFrame.copy())
+        if self.frameQueue is not None:
+            self.frameQueue.put([frame, resultsFrame])
 
 
     # =========================================================================
@@ -1181,7 +1298,7 @@ class Base(object):
             self.sock.sendto(instruction.encode(), (ip, self.port))
             name = next((robot.name for robot in self.robots.values() if robot.IP == ip), ip)
             if printing:
-                print(f"Mensaje enviado a {name}: {instruction}")
+                self.log(f'Mensaje enviado a {name}: {instruction}')
 
 
     @runOnThread
@@ -1219,27 +1336,22 @@ class Base(object):
                     if robotFound:
                         self.sendPositionToRobot(ip, id)
                     if len(parts) >= 5 and parts[1] == 'BUG2':
-                        b_state = parts[2]
-                        b_steps = parts[3]
-                        b_dist  = parts[4]
-                        print(f"[Bug2 {b_state} paso={b_steps} dist={b_dist}mm] {name}")
+                        self.log(f'Solicitud GT {name}: {parts[2]} paso={parts[3]} dist={parts[4]}mm')
                     else:
-                        print(f"Solicitud de posición de {name}")
+                        self.log(f'Solicitud de posición de {name}')
 
                 elif command == 'LEADER_POSITION':
                     if len(parts) >= 5:
                         leaderID = parts[1]
-                        leaderX = float(parts[2])
-                        leaderY = float(parts[3])
-                        leaderAngle = float(parts[4])
+                        leaderX, leaderY, leaderAngle = float(parts[2]), float(parts[3]), float(parts[4])
                         self.updateRobotPosition(leaderID, leaderX, leaderY, leaderAngle)
-                        print(f"Posición de líder {leaderID}: x={leaderX}, y={leaderY}, angle={leaderAngle}")
+                        self.log(f'Posición de líder {leaderID}: ({leaderX},{leaderY}) {leaderAngle}°')
 
                 elif command == 'CHECK_OBSTACLE':
                     continue
 
                 else:
-                    print(f"Mensaje de {name}: {message}")
+                    self.log(f'Mensaje de {name}: {message}')
 
 
     @runOnThread
@@ -1257,14 +1369,13 @@ class Base(object):
 
         robot = self.robots[robotID]
         x, y, angle = robot.getPose()
-
         if x == -1 and y == -1 and angle == -1:
             print(f"Posición no disponible para robot {robotID} (no visible en ArUco)")
             return
 
         message = f'POSITION_RESPONSE|{x}|{y}|{angle}'
         self.sendInstruction(robotIP, [message], False)
-        print(f"Posición enviada a {robot.name}: x={x}, y={y}, angle={angle}")
+        self.log(f'Posición enviada a {robot.name}: x={x}, y={y}, angle={angle}')
 
 
     # =========================================================================
@@ -1434,10 +1545,8 @@ base = Base()
 
 
 def main():
-    
     configurationFilePath = 'configSystem.json'
     base.numRobots = int(input('Cantidad de robots en la prueba: '))
-
     base.readConfigFile(configurationFilePath)
     base.cameraProcessing()
 

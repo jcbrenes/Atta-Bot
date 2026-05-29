@@ -20,7 +20,7 @@ IPS = [
 ]
 
 # Ruta a espota.py (ajústala si tu instalación es diferente)
-ESPOTA = os.path.expanduser("/home/thrain/.arduino15/packages/esp32/hardware/esp32/3.3.7/tools/espota.py")
+ESPOTA = os.path.expanduser("/home/thrain/.arduino15/packages/esp32/hardware/esp32/3.3.8/tools/espota.py")
 
 def upload(ip):
     print(f"🚀 Subiendo firmware a {ip} ...")

@@ -149,6 +149,63 @@ struct biasStore {
 
 
 // ============================================================================
+// AUTOTUNING PID — Relay Method (Åström-Hägglund)
+// ============================================================================
+
+struct AutotuneState {
+  enum Phase : uint8_t { IDLE, WARMUP, MEASURING, DONE };
+
+  Phase phase         = IDLE;
+  float setpointMms   = 0.0f;   // velocidad objetivo para el test (mm/s)
+  float relayPWM      = 0.0f;   // amplitud del relay en cuentas PWM
+  float hysteresisMms = 5.0f;   // banda muerta para detección de cruce por cero (mm/s)
+
+  int8_t relayL = 1, relayR = -1;    // dirección actual del relay por rueda (+1/-1)
+  int8_t prevSignL = 0, prevSignR = 0; // signo previo del error para detección de cruce
+
+  unsigned long lastCrossL = 0, lastCrossR = 0; // timestamp último cruce por cero
+
+  static constexpr int kMaxSamples = 14; // máximo de semiciclos a registrar
+  float halfPeriodsL[kMaxSamples];
+  float halfPeriodsR[kMaxSamples];
+  float ampsL[kMaxSamples];
+  float ampsR[kMaxSamples];
+  int   samplesL = 0, samplesR = 0;
+
+  float peakL = 0.0f, peakR = 0.0f;  // pico de error en el semiciclo actual
+
+  unsigned long phaseStart = 0;
+
+  // Gains propuestos, pendientes de confirmación con SAVEPID
+  float pendingKp = -1.0f, pendingKi = -1.0f, pendingKd = -1.0f;
+
+  static constexpr unsigned long kWarmupMs   = 1500;  // ms de precalentamiento
+  static constexpr int           kMinSamples = 6;     // semiciclos mínimos para calcular
+  static constexpr unsigned long kTimeoutMs  = 60000; // ms máximos (T_half ≈ 8s → 7 muestras en 60s)
+
+  bool IsActive()          const { return phase != IDLE; }
+  bool HasPendingGains()   const { return pendingKp >= 0.0f; }
+  bool HasEnoughSamples()  const { return samplesL >= kMinSamples && samplesR >= kMinSamples; }
+
+  void Begin(float setpoint, float relay, float hyst) {
+    phase         = WARMUP;
+    phaseStart    = millis();
+    setpointMms   = setpoint;
+    relayPWM      = relay;
+    hysteresisMms = hyst;
+    relayL = 1; relayR = 1;   // STRAIGHT: ambas ruedas adelante para primer semiciclo
+    prevSignL = prevSignR = 0;
+    lastCrossL = lastCrossR = millis();
+    samplesL = samplesR = 0;
+    peakL = peakR = 0.0f;
+    pendingKp = pendingKi = pendingKd = -1.0f;
+  }
+
+  void Abort() { phase = IDLE; }
+};
+
+
+// ============================================================================
 // ENUMERACIONES
 // ============================================================================
 
@@ -171,7 +228,7 @@ enum RobotState {
     RESUME_AFTER_EVASION,
     BUG2_SEEK,
     BUG2_WALL_FOLLOW,
-    BUG2_REQUEST_POSITION
+    AUTOTUNE
 };
 
 
@@ -192,7 +249,7 @@ struct NavigationTarget {
     
     // Control de segmentos dinámico
     float segmentDistance = 250;
-    float arrivalThreshold = 80;
+    float arrivalThreshold = 50;
     float minSegmentDistance = 50;
     float maxSegmentDistance = 350;
     
@@ -209,7 +266,7 @@ struct NavigationTarget {
     const int maxHistorySize = 10;
     float lastDistance = 999999.0;  // Distancia en iteración anterior
     int iterationsWithoutProgress = 0;
-    const int maxIterationsWithoutProgress = 3;
+    const int maxIterationsWithoutProgress = 6;
     unsigned long navigationStartTime = 0;
     const unsigned long maxNavigationTime = 300000;  // 5 minutos
     
@@ -243,7 +300,7 @@ struct NavigationTarget {
     
     bool IsInLoop(float currentX, float currentY) {
         // Verificar si volvimos a una posición visitada recientemente
-        const float loopThreshold = 100.0;  // 10cm
+        const float loopThreshold = 40.0;  // menor que arrivalThreshold para no disparar cerca del goal
         
         for (const auto& pos : positionHistory) {
             float dx = currentX - pos.x;
@@ -272,7 +329,7 @@ struct NavigationTarget {
     }
     
     bool IsMakingProgress(float currentDistance) {
-        const float progressThreshold = 20.0;  // 2cm mínimo de progreso
+        const float progressThreshold = 10.0;  // mínimo de progreso por iteración
         
         if (currentDistance >= lastDistance - progressThreshold) {
             iterationsWithoutProgress++;
@@ -332,10 +389,11 @@ struct Bug2State {
     // === Configuración ===
     bool isActive = false;
     bool pendingInit = false;   // true entre BUG2 recibido y primer POSITION_RESPONSE
-    float arrivalThreshold = 80;          // mm para considerar "llegó"
+    float arrivalThreshold = 50;          // mm para considerar "llegó"
     float mLineThreshold = 150;           // mm de tolerancia para cruzar línea M
     int wallFollowDirection = 1;          // 1 = seguir pared derecha, -1 = izquierda
     bool directionAutoSet = false;        // true cuando la dirección ya fue determinada
+    float seekSegmentDistance = 250;      // mm por segmento en GOAL_SEEK
     float wallFollowSegment = 200;        // mm por segmento de avance al seguir pared
     float wallFollowTurnAngle = 30;       // grados por giro al seguir pared
 
@@ -742,5 +800,59 @@ inline float CalculateAngleToTarget(float x1, float y1, float x2, float y2) {
 inline bool InRange(float value, float min, float max) {
     return value >= min && value <= max;
 }
+
+/***************************************************************************************
+ * Estructura: ReactiveNav
+ *
+ * Navegación iterativa unificada con evasión reactiva de obstáculos.
+ * Reemplaza Bug2State para GT y congregación: un solo camino de código
+ * que maneja ambos comportamientos — el objetivo puede ser fijo (GT) o
+ * actualizable (congregación con líder en movimiento).
+ *
+ * Algoritmo por paso:
+ *   1. Calcular ángulo hacia objetivo
+ *   2. Modificar ángulo si hay obstáculo en IR (capa reactiva)
+ *   3. Encolar TURN + WAIT + MOVE + WAIT + REQUEST_POSITION
+ *   4. Al recibir nueva posición, repetir
+ *
+ * La dirección de evasión se elige automáticamente hacia el lado del objetivo
+ * para "doblar alrededor" del obstáculo en la dirección correcta.
+ ***************************************************************************************/
+struct ReactiveNav {
+    bool  isActive    = false;
+    bool  pendingInit = false;   // true entre comando GT/CONGREGATION y primer POSITION_RESPONSE
+    float goalX = 0, goalY = 0;
+
+    // Parámetros configurables
+    float arrivalThreshold  = 50;    // mm para declarar llegada
+    float segmentDistance   = 250;   // mm máximo por segmento normal
+    float avoidSegment      = 120;   // mm por segmento cuando hay obstáculo
+    float avoidFrontAngle   = 90.0f; // grados a girar si obstáculo frontal
+    float avoidSideAngle    = 35.0f; // grados de bias si obstáculo lateral
+
+    unsigned long startTime = 0;
+    const unsigned long maxNavTime = 180000; // 3 min timeout
+
+    void Start(float gx, float gy) {
+        goalX = gx;  goalY = gy;
+        isActive    = true;
+        pendingInit = false;
+        startTime   = millis();
+    }
+
+    void Reset() {
+        isActive    = false;
+        pendingInit = false;
+        goalX = 0;  goalY = 0;
+    }
+
+    bool HasReached(float x, float y) const {
+        return CalculateDistance(x, y, goalX, goalY) < arrivalThreshold;
+    }
+
+    bool HasTimedOut() const {
+        return (millis() - startTime) > maxNavTime;
+    }
+};
 
 #endif // UTILS_H

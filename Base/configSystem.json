@@ -1,31 +1,45 @@
 {
         "vision_system": {
-            "camera_index": 2,
-            "camera_resolution": "1280x720",
-            "debug_resolution": "640x360",
-            "path_cameraMatrix": "cameraMatrix.txt",
-            "path_distance": "dist.txt",
-            "mmPixel": "39/23",
-            "frame_processing_interval": 0.05,
-            "marker_size_mm": 80,
-            "origin_x_mm": -1496.6,
-            "origin_y_mm": -840.8
+                "camera_index": 2,
+                "camera_resolution": "1280x720",
+                "debug_resolution": "640x360",
+                "path_cameraMatrix": "cameraMatrix.txt",
+                "path_distance": "dist.txt",
+                "mmPixel": "39/23",
+                "frame_processing_interval": 0.05,
+                "marker_size_mm": 80,
+                "origin_x_mm": -1257.7,
+                "origin_y_mm": -341.6,
+                "reference_marker_id": "5"
         },
         "udp_communication": {
-            "base_ip": "192.168.1.100",
-            "broadcast_ip": "192.168.1.255",
-            "port": 6060,
-            "network_interface": "enp3s0"
+                "base_ip": "192.168.1.100",
+                "broadcast_ip": "192.168.1.255",
+                "port": 6060,
+                "network_interface": "enp3s0"
         },
         "general": {
-            "debug_enable": true,
-            "path_save_videos": "Videos",
-            "path_save_position_logs": "PositionLogs",
-            "path_save_console_logs": "ConsoleLogs"
+                "debug_enable": true,
+                "path_save_videos": "Videos",
+                "path_save_position_logs": "PositionLogs",
+                "path_save_console_logs": "ConsoleLogs"
         },
         "robots": {
-            "0": { "name": "Atta_0" },
-            "1": { "name": "Atta_1" },
-            "2": { "name": "Atta_2" }
+                "0": {
+                        "name": "Atta_0"
+                },
+                "1": {
+                        "name": "Atta_1"
+                },
+                "2": {
+                        "name": "Atta_2"
+                },
+                "3": {
+                        "name": "Atta_3",
+                        "wheel_distance": 53.5
+                },
+                "4": {
+                        "name": "Atta_4"
+                }
         }
-    }
+}
