@@ -29,7 +29,8 @@ SEGMENT_DISTANCE   = 250.0  # mm
 AVOID_SEGMENT      = 120.0  # mm durante evasión
 AVOID_FRONT_ANGLE  = 90.0   # grados cuando hay obstáculo frontal
 AVOID_SIDE_ANGLE   = 35.0   # grados cuando hay obstáculo lateral
-IR_RANGE           = 150.0  # mm — distancia detección IR simulada
+IR_RANGE           = 200.0  # mm — distancia detección IR simulada
+ROBOT_RADIUS       = 75.0   # mm — radio del cuerpo del robot
 
 
 # ── Ruido del sistema (calibrado en lab) ─────────────────────────────────────
@@ -72,13 +73,30 @@ class SimRobot:
         actual_deg += random.gauss(0, 0.5)   # ruido pequeño
         self.angle = (self.angle + actual_deg) % 360
 
-    def move(self, distance: float):
-        """Avanza en la dirección actual. Con pequeño drift lateral."""
+    def move(self, distance: float, world: 'SimWorld' = None):
+        """
+        Avanza en sub-pasos de 20mm para registrar trayectoria real
+        y detectar colisiones durante el movimiento.
+        Devuelve True si completó el movimiento, False si colisionó.
+        """
         actual_dist = distance * (1 + random.gauss(0, MOTOR_DRIFT_SIGMA))
         rad = math.radians(self.angle)
-        self.x += math.cos(rad) * actual_dist
-        self.y += math.sin(rad) * actual_dist
-        self.trajectory.append((self.x, self.y))
+        step = 20.0  # sub-pasos de 20mm
+        traveled = 0.0
+        while traveled < actual_dist:
+            d = min(step, actual_dist - traveled)
+            self.x += math.cos(rad) * d
+            self.y += math.sin(rad) * d
+            traveled += d
+            self.trajectory.append((self.x, self.y))
+            # Colisión con obstáculos durante el movimiento
+            if world and world.collides(self):
+                # Retroceder al último punto válido
+                self.x -= math.cos(rad) * d
+                self.y -= math.sin(rad) * d
+                self.trajectory[-1] = (self.x, self.y)
+                return False
+        return True
 
     def get_pose_noisy(self) -> Tuple[float, float, float]:
         """Simula lo que devuelve ArUco: posición real + ruido gaussiano."""
@@ -103,34 +121,43 @@ class SimWorld:
         self.robots: List[SimRobot]   = []
         self.obstacles: List[Obstacle] = []
 
+    def collides(self, robot: SimRobot) -> bool:
+        """True si el cuerpo del robot toca un obstáculo ESTÁTICO."""
+        for o in self.obstacles:
+            dx = robot.x - o.x; dy = robot.y - o.y
+            if math.sqrt(dx*dx + dy*dy) < o.radius + ROBOT_RADIUS:
+                return True
+        return False
+
     def check_ir(self, robot: SimRobot) -> dict:
         """
-        Simula los sensores IR del robot.
-        Devuelve {front, right, left} como bool.
-        Comprueba obstáculos estáticos y otros robots.
+        Simula los sensores IR del robot usando distancia real al borde del obstáculo.
+        Detecta si el borde (superficie) del obstáculo está dentro del rango IR
+        y en el ángulo del sensor (±45°).
         """
+        # Solo obstáculos físicos — otros robots se detectan por ArUco, no por IR
         targets = [(o.x, o.y, o.radius) for o in self.obstacles]
-        for r in self.robots:
-            if r.robot_id != robot.robot_id:
-                targets.append((r.x, r.y, 60.0))
 
-        rad  = math.radians(robot.angle)
-        # Vectores para los tres sensores (frente, derecha -30°, izquierda +30°)
-        sensors = {
-            'front': (rad,          'front'),
-            'right': (rad - math.radians(30), 'right'),
-            'left':  (rad + math.radians(30), 'left'),
+        sensor_angles = {
+            'front': robot.angle,
+            'right': robot.angle - 30,
+            'left':  robot.angle + 30,
         }
         result = {'front': False, 'right': False, 'left': False}
 
-        for key, (srad, _) in sensors.items():
-            sx = robot.x + math.cos(srad) * IR_RANGE
-            sy = robot.y + math.sin(srad) * IR_RANGE
-            for (tx, ty, tr) in targets:
-                dx = sx - tx; dy = sy - ty
-                if math.sqrt(dx*dx + dy*dy) < tr + 20:
+        for (tx, ty, tr) in targets:
+            dx = tx - robot.x; dy = ty - robot.y
+            dist_to_center = math.sqrt(dx*dx + dy*dy)
+            dist_to_edge   = max(0.0, dist_to_center - tr - ROBOT_RADIUS)
+            if dist_to_edge > IR_RANGE:
+                continue
+            # Ángulo hacia el obstáculo
+            angle_to_obs = math.degrees(math.atan2(dy, dx)) % 360
+            for key, sang in sensor_angles.items():
+                sang = sang % 360
+                diff = abs(((angle_to_obs - sang) + 180) % 360 - 180)
+                if diff < 45:
                     result[key] = True
-                    break
 
         return result
 
@@ -208,7 +235,13 @@ class ReactiveNav:
 # ── Bucle de simulación ──────────────────────────────────────────────────────
 def run_simulation(robot: SimRobot, nav: ReactiveNav, world: SimWorld,
                    max_steps: int = 100) -> dict:
-    """Ejecuta la simulación hasta llegar o agotar pasos."""
+    """
+    Ejecuta la simulación.
+    El IR se verifica al inicio de cada paso Y durante el MOVE (sub-pasos de 20mm),
+    igual que el firmware donde el sensor IR dispara por interrupción.
+    Si durante el MOVE se detecta un obstáculo, el paso se interrumpe y
+    se recalcula la navegación desde la posición actual.
+    """
     arrived = False
     for _ in range(max_steps):
         ir = world.check_ir(robot)
@@ -217,9 +250,38 @@ def run_simulation(robot: SimRobot, nav: ReactiveNav, world: SimWorld,
             arrived = True
             break
         arc, seg = result
+
         if abs(arc) > math.radians(5) * CENTER_TO_WHEEL:
             robot.turn(arc)
-        robot.move(seg)
+
+        # MOVE con re-evaluación IR cada sub-paso (como interrupción en firmware)
+        actual_dist = seg * (1 + random.gauss(0, MOTOR_DRIFT_SIGMA))
+        rad = math.radians(robot.angle)
+        sub = 20.0
+        traveled = 0.0
+        interrupted = False
+        while traveled < actual_dist:
+            d = min(sub, actual_dist - traveled)
+            robot.x += math.cos(rad) * d
+            robot.y += math.sin(rad) * d
+            traveled += d
+            robot.trajectory.append((robot.x, robot.y))
+
+            if world.collides(robot):
+                robot.x -= math.cos(rad) * d
+                robot.y -= math.sin(rad) * d
+                robot.trajectory[-1] = (robot.x, robot.y)
+                interrupted = True
+                break
+
+            # Chequeo IR continuo durante el movimiento
+            mid_ir = world.check_ir(robot)
+            if any(mid_ir.values()) and not any(ir.values()):
+                interrupted = True
+                break
+
+        if interrupted:
+            nav.steps += 1  # cuenta como paso
 
     dx = nav.goal_x - robot.x
     dy = nav.goal_y - robot.y
@@ -247,10 +309,16 @@ def plot_scenario(world: SimWorld, nav_goals: list, title: str, metrics: list):
     ax.set_xlabel('X (mm)'); ax.set_ylabel('Y (mm)')
     ax.grid(True, alpha=0.3)
 
-    # Obstáculos
+    # Obstáculos — relleno + borde sólido para ver claramente el límite
     for obs in world.obstacles:
-        circle = plt.Circle((obs.x, obs.y), obs.radius, color='gray', alpha=0.5)
-        ax.add_patch(circle)
+        ax.add_patch(plt.Circle((obs.x, obs.y), obs.radius,
+                                color='gray', alpha=0.4))
+        ax.add_patch(plt.Circle((obs.x, obs.y), obs.radius,
+                                color='black', fill=False, linewidth=1.5))
+        # Zona de detección IR (radio + IR_RANGE)
+        ax.add_patch(plt.Circle((obs.x, obs.y), obs.radius + IR_RANGE,
+                                color='gray', fill=False,
+                                linestyle=':', linewidth=0.8, alpha=0.4))
 
     # Objetivos
     for (gx, gy) in nav_goals:
@@ -312,13 +380,14 @@ def scenario_gt_basic():
 
 
 def scenario_gt_obstacle():
-    """GT con barrera en el camino."""
+    """GT con obstáculo desviado de la trayectoria directa."""
     world = SimWorld()
-    robot = SimRobot(x=150, y=600, angle=10, robot_id=1)
+    # Robot va de (200,900) a (1400,300) — línea diagonal
+    robot = SimRobot(x=200, y=900, angle=340, robot_id=1)
     world.robots.append(robot)
-    # Barrera de 3 obstáculos circulares
-    for oy in [450, 600, 750]:
-        world.obstacles.append(Obstacle(x=800, y=oy, radius=100))
+    # Obstáculo cerca del centro del camino pero no exactamente en él
+    world.obstacles.append(Obstacle(x=750, y=570, radius=100))
+    world.obstacles.append(Obstacle(x=900, y=650, radius=80))
 
     nav = ReactiveNav()
     nav.start(1500, 600)
