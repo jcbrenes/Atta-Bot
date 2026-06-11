@@ -178,6 +178,10 @@ unsigned long currentMicros = micros();
 unsigned long previousMicros = micros();
 bool isLateralCycleActive = false;
 bool isCentralCycleActive = false;
+// Máscaras de sensores IR — true = ignorar ese sensor (SENSOR_MASK|L/R/C|1)
+bool maskLeftIR = false;
+bool maskRightIR = false;
+bool maskCentralIR = false;
 int cycleCounter = 0;
 int microsDifference;
 volatile unsigned long leftObsStartTime = 0;
@@ -197,9 +201,11 @@ ReactiveNav nav;
 
 // IMU-assisted TURN: captura yaw al inicio y corrige si el giro quedó corto
 bool  imuTurnActive   = false;
+bool  imuTurnIsCorrection = false;  // true mientras se ejecuta una micro-corrección (máx 1 por TURN)
 float imuTurnStartYaw = 0.0f;
 float imuTurnTargetDeg = 0.0f;   // ángulo objetivo con signo (+ = CCW, - = CW)
-const float imuTurnTolerance = 3.0f;  // ±3° de tolerancia antes de corregir
+const float imuTurnTolerance = 10.0f;  // errores < 10° no se corrigen: arcos < ~7mm salen bruscos
+                                       // e impredecibles (stiction); ArUco corrige el residuo en nav
 const int instructionCompletedDelay = 400;
 std::array<float, 2> fsmInstruction;
 std::deque<std::array<float, 2>> instructionList;
@@ -659,17 +665,26 @@ void loop() {
         if (delta < -180.0f) delta += 360.0f;
 
         float error = imuTurnTargetDeg - delta;  // positivo = giró de menos
-        MessageDebugf("DEBUG: -1, ID: %s, TURN IMU: objetivo=%.1f° real=%.1f° error=%.1f°",
-                      robotID.c_str(), imuTurnTargetDeg, delta, error);
+        // Wrap a [-180,180]: en TURN|180 el delta sale como -179.4 y sin
+        // wrap el error daba 359° → corrección de vuelta completa
+        if (error >  180.0f) error -= 360.0f;
+        if (error < -180.0f) error += 360.0f;
+        MessageDebugf("DEBUG: -1, ID: %s, TURN IMU: objetivo=%.1f° real=%.1f° error=%.1f° (yaw %.1f→%.1f)",
+                      robotID.c_str(), imuTurnTargetDeg, delta, error,
+                      imuTurnStartYaw, yaw);
 
-        if (abs(error) > imuTurnTolerance) {
-          // Encolar micro-corrección al frente de la lista
+        if (abs(error) > imuTurnTolerance && !imuTurnIsCorrection) {
+          // Encolar UNA micro-corrección; la corrección no genera otra
+          // (encadenarlas causaba giro infinito: arcos de <20mm oscilan)
           float corrArc = radians(error) * centerToWheelDistance;
           fsmInstruction[0] = TURN;
           fsmInstruction[1] = corrArc;
           instructionList.push_front(fsmInstruction);
+          imuTurnIsCorrection = true;
           MessageDebugf("DEBUG: -1, ID: %s, TURN corrección: %.1f° (arc=%.1fmm)",
                         robotID.c_str(), error, corrArc);
+        } else {
+          imuTurnIsCorrection = false;
         }
         imuTurnActive = false;
       }
@@ -702,6 +717,7 @@ void loop() {
       }
 
       imuTurnActive = false;  // cancelar seguimiento IMU si el giro fue interrumpido
+      imuTurnIsCorrection = false;
       state = STOP;
     }
 
@@ -1740,9 +1756,11 @@ void ReadSensors() {
       interrupts();
 
       unsigned long now = micros();
-      obstacles.leftObstacle = (digitalRead(leftInfraredSensor) == LOW) &&
+      obstacles.leftObstacle = !maskLeftIR &&
+                               (digitalRead(leftInfraredSensor) == LOW) &&
                                ((now - leftTime) >= minObstacleTime);
-      obstacles.rightObstacle = (digitalRead(rightInfraredSensor) == LOW) &&
+      obstacles.rightObstacle = !maskRightIR &&
+                                (digitalRead(rightInfraredSensor) == LOW) &&
                                 ((now - rightTime) >= minObstacleTime);
     }
 
@@ -1751,7 +1769,7 @@ void ReadSensors() {
       // inicializado.
       if (frontSensorInitialized) {
         centralDistance = frontSensor.readProximity();
-        if (centralDistance > 2) {
+        if (centralDistance > 2 && !maskCentralIR) {
           obstacles.centralObstacle =
               (micros() - centralObsStartTime) >= minObstacleTime / 2;
         } else {
@@ -2611,8 +2629,9 @@ void ReadUdpPackets() {
     if (arguments[1] == "SEGMENT_DIST") {
       float newDist = arguments[2].toFloat();
       if (newDist >= 50 && newDist <= 400) {
-        bug2.seekSegmentDistance = newDist;
-        navTarget.segmentDistance = newDist;  // compat
+        nav.segmentDistance = newDist;        // ReactiveNav (GT/congregación actual)
+        bug2.seekSegmentDistance = newDist;   // compat Bug2 legacy
+        navTarget.segmentDistance = newDist;
         char buf[60];
         snprintf(buf, sizeof(buf), "NAV_CONFIG: segmento=%.0fmm", newDist);
         SendMessage(robots["Base"], buf);
@@ -2620,7 +2639,8 @@ void ReadUdpPackets() {
     } else if (arguments[1] == "ARRIVAL_THRESHOLD") {
       float newThr = arguments[2].toFloat();
       if (newThr >= 5 && newThr <= 200) {
-        bug2.arrivalThreshold = newThr;
+        nav.arrivalThreshold = newThr;        // ReactiveNav (GT/congregación actual)
+        bug2.arrivalThreshold = newThr;       // compat Bug2 legacy
         char buf[60];
         snprintf(buf, sizeof(buf), "NAV_CONFIG: llegada=%.0fmm", newThr);
         SendMessage(robots["Base"], buf);
@@ -2634,6 +2654,19 @@ void ReadUdpPackets() {
         SendMessage(robots["Base"], buf);
       }
     }
+  }
+
+  // SENSOR_MASK — ignora un sensor IR (diagnóstico de falsos positivos)
+  // Uso: SENSOR_MASK|L|1 (ignorar izquierdo)  SENSOR_MASK|L|0 (reactivar)
+  else if (command == "SENSOR_MASK") {
+    bool masked = (arguments[2].toInt() != 0);
+    if      (arguments[1] == "L") maskLeftIR    = masked;
+    else if (arguments[1] == "R") maskRightIR   = masked;
+    else if (arguments[1] == "C") maskCentralIR = masked;
+    char buf[80];
+    snprintf(buf, sizeof(buf), "SENSOR_MASK: L=%d R=%d C=%d (1=ignorado)",
+             (int)maskLeftIR, (int)maskRightIR, (int)maskCentralIR);
+    SendMessage(robots["Base"], buf);
   }
 
   // GET_STATUS
@@ -2958,39 +2991,47 @@ void setupIMU() {
 void LeerYaw() {
   if (!imuAvailable) return;
 
+  // El DMP produce a ~112Hz y este loop lee a ≤50Hz: hay que drenar TODOS
+  // los paquetes pendientes y quedarse con el más reciente. No usar
+  // resetFIFO() con el DMP activo — deja paquetes parciales que corrompen
+  // las lecturas siguientes (yaw congelado durante giros).
   icm_20948_DMP_data_t data;
-  imu.readDMPdataFromFIFO(&data);
+  bool   gotQuat = false;
+  double q1 = 0, q2 = 0, q3 = 0;
 
-  if ((imu.status != ICM_20948_Stat_Ok) &&
-      (imu.status != ICM_20948_Stat_FIFOMoreDataAvail)) {
-    if (imu.status != ICM_20948_Stat_FIFONoDataAvail) {
-      DebugSerialPrintf("Error leyendo FIFO: %d\n", imu.status);
+  for (int i = 0; i < 20; i++) {
+    imu.readDMPdataFromFIFO(&data);
+
+    if ((imu.status != ICM_20948_Stat_Ok) &&
+        (imu.status != ICM_20948_Stat_FIFOMoreDataAvail)) {
+      if (imu.status != ICM_20948_Stat_FIFONoDataAvail) {
+        DebugSerialPrintf("Error leyendo FIFO: %d\n", imu.status);
+      }
+      break;
     }
-    return;
+
+    if ((data.header & DMP_header_bitmap_Quat9) > 0) {
+      q1 = ((double)data.Quat9.Data.Q1) / 1073741824.0;
+      q2 = ((double)data.Quat9.Data.Q2) / 1073741824.0;
+      q3 = ((double)data.Quat9.Data.Q3) / 1073741824.0;
+      gotQuat = true;
+    }
+
+    if ((data.header & DMP_header_bitmap_Accel) > 0) {
+      float accX = (float)data.Raw_Accel.Data.X / conversionFactor;
+      float accY = (float)data.Raw_Accel.Data.Y / conversionFactor;
+      float accZ = (float)data.Raw_Accel.Data.Z / conversionFactor;
+      imuGravity = sqrt(accX * accX + accY * accY + accZ * accZ);
+    }
+
+    if (imu.status != ICM_20948_Stat_FIFOMoreDataAvail) break;
   }
 
-  if ((data.header & DMP_header_bitmap_Quat9) == 0) {
-    return;  // Sin datos de quaternion en este ciclo — normal a baja ODR
+  if (gotQuat) {
+    double q0 = sqrt(1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3)));
+    double t3 = +2.0 * (q0 * q3 + q1 * q2);
+    double t4 = +1.0 - 2.0 * (q2 * q2 + q3 * q3);
+    yaw = fmod(-atan2(t3, t4) * RAD_TO_DEG + 450.0, 360.0);
+    DebugSerialPrintf("Yaw actual: %.2f°\n", yaw);
   }
-
-  double q1 = ((double)data.Quat9.Data.Q1) / 1073741824.0;
-  double q2 = ((double)data.Quat9.Data.Q2) / 1073741824.0;
-  double q3 = ((double)data.Quat9.Data.Q3) / 1073741824.0;
-  double q0 = sqrt(1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3)));
-
-  double t3 = +2.0 * (q0 * q3 + q1 * q2);
-  double t4 = +1.0 - 2.0 * (q2 * q2 + q3 * q3);
-  yaw = fmod(-atan2(t3, t4) * RAD_TO_DEG + 450.0, 360.0);
-
-  DebugSerialPrintf("Yaw actual: %.2f°\n", yaw);
-
-  if ((data.header & DMP_header_bitmap_Accel) > 0) {
-    float accX = (float)data.Raw_Accel.Data.X / conversionFactor;
-    float accY = (float)data.Raw_Accel.Data.Y / conversionFactor;
-    float accZ = (float)data.Raw_Accel.Data.Z / conversionFactor;
-    imuGravity = sqrt(accX * accX + accY * accY + accZ * accZ);
-    DebugSerialPrintf("Gravedad: %.3f g\n", imuGravity);
-  }
-
-  imu.resetFIFO();
 }

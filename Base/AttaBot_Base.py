@@ -513,6 +513,14 @@ class Base(object):
         - tuple: (robotIP, isValidFrame)
         """
         if robotIP is None:
+            # Snapshot del ángulo de cada robot ANTES del giro de identificación.
+            # Comparar contra el snapshot (y no frame-a-frame) evita que el giro
+            # se vea "en cachitos" <45° cuando hay frames atrasados en el buffer.
+            self._setupAngleSnapshot = {}
+            for robot in self.robots.values():
+                pose = robot.getPose()
+                if pose != (-1, -1, -1):
+                    self._setupAngleSnapshot[robot.id] = pose[2]
             robotIP = self.setupMoveRobot(robotsIPs)
             isValidFrame = False
         else:
@@ -557,14 +565,26 @@ class Base(object):
             if robot.id in configuredRobots:
                 continue
 
-            displacement = robot.getDisplacement()
-            if displacement is not None:
-                _, angularDisplacement = displacement
-                if abs(angularDisplacement) >= 45:
-                    robotIP = robotsIPs.pop()
-                    robot.setupIP(robotIP)
-                    configuredRobots.add(robot.id)
-                    break
+            pose = robot.getPose()
+            refAngle = getattr(self, '_setupAngleSnapshot', {}).get(robot.id)
+
+            now = time.time()
+            if now - getattr(self, '_setupDbgTime', 0) >= 1.0:
+                self._setupDbgTime = now
+                visible = pose != (-1, -1, -1)
+                print(f"[Setup-dbg] Robot {robot.id}: visible={visible} "
+                      f"ref={refAngle} actual={pose[2] if visible else '—'} "
+                      f"disp={robot.angularDisplacement(refAngle, pose[2]) if (visible and refAngle is not None) else '—'}")
+
+            if pose == (-1, -1, -1) or refAngle is None:
+                continue
+
+            angularDisp = robot.angularDisplacement(refAngle, pose[2])
+            if abs(angularDisp) >= 45:
+                robotIP = robotsIPs.pop()
+                robot.setupIP(robotIP)
+                configuredRobots.add(robot.id)
+                break
 
         return None
 
