@@ -609,7 +609,9 @@ struct CongregationState {
     unsigned long lastRequestTime = 0;
     bool waitingForResponse = false;
     const unsigned long requestTimeout = 5000;
-    
+    int followerIndex = 0;    // slot asignado por la Base (0-based)
+    int totalFollowers = 1;   // total de seguidores en la congregación
+
     void Reset() {
         leaderID = "-1";
         isLeader = false;
@@ -619,6 +621,8 @@ struct CongregationState {
         globalTargetY = 0;
         lastRequestTime = 0;
         waitingForResponse = false;
+        followerIndex = 0;
+        totalFollowers = 1;
     }
     
     bool IsActive() {

@@ -1384,10 +1384,8 @@ class Base(object):
 
     def startCongregation(self, leaderID):
         """
-        Inicia el proceso de congregación con un líder designado.
-
-        Parámetros:
-        - leaderID (str): ID del robot líder.
+        Inicia congregación con un líder designado.
+        Asigna un slot de estacionamiento único a cada seguidor (opción B: parking spot).
         """
         if leaderID not in self.robots:
             print(f"Error: Robot líder {leaderID} no encontrado")
@@ -1396,9 +1394,21 @@ class Base(object):
         self.congregationActive = True
         self.leaderID = leaderID
 
-        instruction = f'CONGREGATION|{leaderID}'
-        self.sendInstructionBroadcast([instruction])
-        print(f"Congregación iniciada. Líder: {self.robots[leaderID].name}")
+        # Seguidores ordenados por ID para asignación determinista de slots
+        followers = sorted([rid for rid in self.robots if rid != leaderID])
+        total = len(followers)
+
+        # Enviar al líder (sin índice de follower — solo necesita saber que es líder)
+        leader_cmd = f'CONGREGATION|{leaderID}|0|{total}'
+        self.sendInstruction(self.robots[leaderID].IP, [leader_cmd], False)
+
+        # Enviar a cada seguidor su slot individual
+        for idx, rid in enumerate(followers):
+            cmd = f'CONGREGATION|{leaderID}|{idx}|{total}'
+            self.sendInstruction(self.robots[rid].IP, [cmd], False)
+            print(f"  Seguidor {self.robots[rid].name}: slot {idx}/{total}")
+
+        print(f"Congregación iniciada. Líder: {self.robots[leaderID].name}, {total} seguidor(es)")
 
 
     def sendToGlobalPosition(self, robotID, targetX, targetY):

@@ -2447,13 +2447,16 @@ void ReadUdpPackets() {
     congregation.isLeader = (congregation.leaderID == robotID);
     congregation.positionReceived = false;
     congregation.hasGlobalTarget = false;
+    congregation.followerIndex  = arguments[2].toInt();
+    congregation.totalFollowers = (arguments[3] != "") ? arguments[3].toInt() : 1;
 
     nav.Reset();
     navTarget.Reset();
     instructionList.clear();
 
-    MessageDebugf("DEBUG: -1, ID: %s, Congregación iniciada. Líder: %s",
-                  robotID.c_str(), congregation.leaderID.c_str());
+    MessageDebugf("DEBUG: -1, ID: %s, Congregación iniciada. Líder: %s, slot: %d/%d",
+                  robotID.c_str(), congregation.leaderID.c_str(),
+                  congregation.followerIndex, congregation.totalFollowers);
 
     int delay = robotID.toInt() * 200;
     fsmInstruction[0] = WAIT;
@@ -2554,21 +2557,28 @@ void ReadUdpPackets() {
       float leaderX = arguments[2].toFloat();
       float leaderY = arguments[3].toFloat();
 
+      // Calcular punto de estacionamiento: slot en círculo alrededor del líder
+      // Distancia = 200mm (dos radios de robot + margen de 50mm)
+      const float PARKING_DIST = 200.0f;
+      int   n     = max(1, congregation.totalFollowers);
+      float angle = (2.0f * PI * congregation.followerIndex) / n;
+      float parkX = leaderX + PARKING_DIST * cos(angle);
+      float parkY = leaderY + PARKING_DIST * sin(angle);
+
       if (nav.isActive) {
-        // Actualizar objetivo sin reiniciar — el siguiente paso usará el nuevo destino
-        nav.goalX = leaderX;
-        nav.goalY = leaderY;
+        nav.goalX = parkX;
+        nav.goalY = parkY;
       } else if (!nav.pendingInit) {
-        nav.goalX       = leaderX;
-        nav.goalY       = leaderY;
+        nav.goalX       = parkX;
+        nav.goalY       = parkY;
         nav.pendingInit = true;
         if (!congregation.waitingForResponse) {
           fsmInstruction[0] = REQUEST_POSITION;
           fsmInstruction[1] = 0;
           instructionList.push_back(fsmInstruction);
         }
-        MessageDebugf("DEBUG: -1, ID: %s, CONGREGATION: iniciando hacia líder (%.1f,%.1f)",
-                      robotID.c_str(), leaderX, leaderY);
+        MessageDebugf("DEBUG: -1, ID: %s, CONGREGATION: slot %d/%d → parking (%.1f,%.1f)",
+                      robotID.c_str(), congregation.followerIndex, n, parkX, parkY);
       }
     }
   }

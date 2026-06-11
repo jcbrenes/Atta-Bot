@@ -400,8 +400,23 @@ def scenario_gt_obstacle():
     plot_scenario(world, [(1500, 600)], 'GT con barrera', [m])
 
 
+PARKING_DIST = 200.0  # mm — 2*ROBOT_RADIUS + margen; igual que el firmware
+
+
+def congregation_parking_spot(leader_x: float, leader_y: float,
+                               follower_index: int, total_followers: int) -> Tuple[float, float]:
+    """
+    Calcula el punto de estacionamiento para un seguidor.
+    Misma fórmula que en el firmware (LEADER_POSITION handler).
+    """
+    n = max(1, total_followers)
+    angle = (2 * math.pi * follower_index) / n
+    return (leader_x + PARKING_DIST * math.cos(angle),
+            leader_y + PARKING_DIST * math.sin(angle))
+
+
 def scenario_congregation():
-    """3 robots convergen hacia el robot 1 (líder)."""
+    """3 robots: robot 1 es líder, robots 2 y 3 convergen a slots de estacionamiento."""
     world = SimWorld()
     colors = ['blue', 'green', 'orange']
     starts = [(200, 200), (1600, 300), (900, 1050)]
@@ -413,20 +428,25 @@ def scenario_congregation():
                          robot_id=i+1, color=colors[i])
         world.robots.append(robot)
 
-    for i, robot in enumerate(world.robots):
+    # Robot 0 es líder — no navega
+    followers = world.robots[1:]
+    total = len(followers)
+    parking_goals = []
+
+    for idx, robot in enumerate(followers):
+        park_x, park_y = congregation_parking_spot(*leader_pos, idx, total)
+        parking_goals.append((park_x, park_y))
         nav = ReactiveNav()
-        nav.start(*leader_pos)
+        nav.start(park_x, park_y)
         metrics_raw = run_simulation(robot, nav, world, max_steps=150)
-        straight = math.sqrt((leader_pos[0]-starts[i][0])**2 +
-                             (leader_pos[1]-starts[i][1])**2)
-        m = {**metrics_raw, 'id': i+1,
+        sx, sy = starts[idx + 1]
+        straight = math.sqrt((park_x - sx)**2 + (park_y - sy)**2)
+        m = {**metrics_raw, 'id': idx + 2,
              'efficiency': straight / metrics_raw['path_len'] if metrics_raw['path_len'] > 0 else 0}
         all_metrics.append(m)
-        print(f"Robot {i+1}: {m}")
+        print(f"Robot {idx+2}: slot {idx}/{total} → parking ({park_x:.0f},{park_y:.0f}) — {m}")
 
-    # Líder como estrella grande
-    ax_goal = [leader_pos]
-    plot_scenario(world, ax_goal, 'Congregación 3 robots', all_metrics)
+    plot_scenario(world, [leader_pos] + parking_goals, 'Congregación 3 robots', all_metrics)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
