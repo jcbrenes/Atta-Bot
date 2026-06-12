@@ -475,6 +475,9 @@ class Base(object):
         foundRobots = set()
 
         for robotId in robots.keys():
+            # El marker de referencia (origen del escenario) no es un robot
+            if robotId == self.referenceMarkerId:
+                continue
             if robotId in self.currentArucoDetections:
                 foundRobots.add(robotId)
 

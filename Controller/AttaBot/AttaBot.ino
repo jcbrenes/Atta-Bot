@@ -68,6 +68,8 @@ float pulsesPerRev = 574;
 const float wheelCircumference = PI * 44.5;
 float millimetersPerPulse = wheelCircumference / pulsesPerRev;
 float centerToWheelDistance = 41.5;  // configurable vía NAV_CONFIG|WHEEL_DIST
+float yawScale = 1.0f;  // escala del gyro por robot (físico/IMU, calibrada con
+                        // ArUco; ±2.4% medido) — NAV_CONFIG|YAW_SCALE|x|SAVE
 
 // Muestreo y velocidad
 const unsigned int samplingTime = 10;
@@ -122,6 +124,9 @@ const float max_workspace_y = 2000;
 const float max_pose_jump =
     500; // Máximo salto permitido en mm por actualización
 const float max_angle_jump = 179; // Máximo salto permitido en grados
+const int max_pose_jump_rejections =
+    3; // Rechazos consecutivos antes de re-sincronizar con la cámara
+int poseJumpRejections = 0;
 
 // IMU
 const float gravity = 9806.65;
@@ -199,13 +204,21 @@ bool movementReady = true;
 // Navegación reactiva unificada (GT + congregación)
 ReactiveNav nav;
 
-// IMU-assisted TURN: captura yaw al inicio y corrige si el giro quedó corto
+// IMU-assisted TURN: giro cerrado en yaw — el arco restante se re-apunta con
+// el IMU en cada ciclo, y al final se corrige si quedó residuo
 bool  imuTurnActive   = false;
 bool  imuTurnIsCorrection = false;  // true mientras se ejecuta una micro-corrección (máx 1 por TURN)
 float imuTurnStartYaw = 0.0f;
+float imuTurnPrevYaw  = 0.0f;    // última lectura para unwrap incremental
+float imuTurnAccumDeg = 0.0f;    // giro acumulado medido por IMU (sin wrap, soporta >180°)
 float imuTurnTargetDeg = 0.0f;   // ángulo objetivo con signo (+ = CCW, - = CW)
-const float imuTurnTolerance = 10.0f;  // errores < 10° no se corrigen: arcos < ~7mm salen bruscos
-                                       // e impredecibles (stiction); ArUco corrige el residuo en nav
+unsigned long imuTurnSettleUntil = 0;  // !=0: motores cortados, midiendo coast
+const float imuTurnBrakeLead = 3.0f;   // cortar motores N° antes: la inercia
+                                       // (coast, 2-12° medido vs ArUco) completa el giro
+const unsigned long imuTurnSettleMs = 400;  // ventana para que el coast termine
+                                            // antes de la verificación final
+const float imuTurnTolerance = 5.0f;   // residuo (coast incluido) que dispara la
+                                       // micro-corrección — ahora closed-loop, aterriza bien
 const int instructionCompletedDelay = 400;
 std::array<float, 2> fsmInstruction;
 std::deque<std::array<float, 2>> instructionList;
@@ -378,6 +391,10 @@ void InitializePPR() {
   }
 
   updateMillimetersPerPulse();
+
+  yawScale = preferences.getFloat("yaw_scale", 1.0f);
+  DebugSerialPrintf("Yaw scale: %.4f\n", yawScale);
+
   preferences.end();
 
   uint64_t chipid = ESP.getEfuseMac();
@@ -650,32 +667,42 @@ void loop() {
   case TURN: {
     // Capturar yaw inicial la primera vez que se entra al estado
     if (imuAvailable && !imuTurnActive) {
-      imuTurnActive    = true;
-      imuTurnStartYaw  = yaw;
+      imuTurnActive      = true;
+      imuTurnStartYaw    = yaw;
+      imuTurnPrevYaw     = yaw;
+      imuTurnAccumDeg    = 0.0f;
+      imuTurnSettleUntil = 0;
       imuTurnTargetDeg = (instructionValue / centerToWheelDistance) * RAD_TO_DEG;
     }
 
-    movementReady = MoveDistanceByWheel(instructionValue, -instructionValue);
+    if (imuAvailable && imuTurnActive) {
+      // Giro cerrado en yaw: acumular el giro real con unwrap incremental y
+      // re-apuntar el arco restante en cada ciclo. El objetivo lo define el
+      // IMU, no la geometría supuesta — rueda loca, stiction y wheel_dist
+      // dejan de producir déficit.
+      float dYaw = yaw - imuTurnPrevYaw;
+      if (dYaw >  180.0f) dYaw -= 360.0f;
+      if (dYaw < -180.0f) dYaw += 360.0f;
+      imuTurnAccumDeg += dYaw * yawScale;  // grados físicos, no crudos del gyro
+      imuTurnPrevYaw   = yaw;
 
-    if (movementReady) {
-      // Verificar con IMU si el giro fue preciso
-      if (imuAvailable && imuTurnActive) {
-        float delta = yaw - imuTurnStartYaw;
-        if (delta >  180.0f) delta -= 360.0f;
-        if (delta < -180.0f) delta += 360.0f;
+      if (imuTurnSettleUntil != 0) {
+        // Motores ya cortados: seguir midiendo hasta que el coast termine,
+        // así la verificación final incluye la inercia (la cámara mostraba
+        // 2-12° de giro extra después del corte que el IMU no contaba)
+        if (millis() < imuTurnSettleUntil) {
+          break;
+        }
+        imuTurnSettleUntil = 0;
 
+        float delta = imuTurnAccumDeg;           // unwrapped: válido >180°
         float error = imuTurnTargetDeg - delta;  // positivo = giró de menos
-        // Wrap a [-180,180]: en TURN|180 el delta sale como -179.4 y sin
-        // wrap el error daba 359° → corrección de vuelta completa
-        if (error >  180.0f) error -= 360.0f;
-        if (error < -180.0f) error += 360.0f;
         MessageDebugf("DEBUG: -1, ID: %s, TURN IMU: objetivo=%.1f° real=%.1f° error=%.1f° (yaw %.1f→%.1f)",
                       robotID.c_str(), imuTurnTargetDeg, delta, error,
                       imuTurnStartYaw, yaw);
 
         if (abs(error) > imuTurnTolerance && !imuTurnIsCorrection) {
           // Encolar UNA micro-corrección; la corrección no genera otra
-          // (encadenarlas causaba giro infinito: arcos de <20mm oscilan)
           float corrArc = radians(error) * centerToWheelDistance;
           fsmInstruction[0] = TURN;
           fsmInstruction[1] = corrArc;
@@ -687,8 +714,41 @@ void loop() {
           imuTurnIsCorrection = false;
         }
         imuTurnActive = false;
-      }
+        movementReady = true;
+      } else {
+        float leftTraveled  = movement.leftPulseCount * millimetersPerPulse;
+        float rightTraveled = movement.rightPulseCount * millimetersPerPulse;
 
+        // Failsafe: si el yaw no avanza (IMU muda/congelada), cerrar por
+        // encoders para no girar infinito
+        if (fabs(leftTraveled) > fabs(instructionValue) * 1.5f + 20.0f) {
+          MessageDebugf("DEBUG: -1, ID: %s, TURN failsafe: yaw estancado "
+                        "(%.1f° de %.1f°), cierro por encoders",
+                        robotID.c_str(), imuTurnAccumDeg, imuTurnTargetDeg);
+          imuTurnActive       = false;
+          imuTurnIsCorrection = false;
+          movementReady       = true;
+        } else {
+          // Frenar imuTurnBrakeLead antes del objetivo: el coast completa
+          float lead = (imuTurnTargetDeg >= 0) ? imuTurnBrakeLead
+                                               : -imuTurnBrakeLead;
+          float remainingArc =
+              radians(imuTurnTargetDeg - lead - imuTurnAccumDeg) *
+              centerToWheelDistance;
+          bool reached = MoveDistanceByWheel(leftTraveled + remainingArc,
+                                             rightTraveled - remainingArc);
+          if (reached) {
+            ConfigureHBridge(0, 0);
+            imuTurnSettleUntil = millis() + imuTurnSettleMs;
+          }
+          movementReady = false;  // el giro termina tras el settle
+        }
+      }
+    } else {
+      movementReady = MoveDistanceByWheel(instructionValue, -instructionValue);
+    }
+
+    if (movementReady) {
       MessageDebugf("DEBUG: -1, ID: %s, Giro completado", robotID.c_str());
       intContext.Clear();
       isEvading = false;
@@ -993,13 +1053,13 @@ void loop() {
     } else {
       if (obstacles.obstacleSensors == 0b100) {
         avoidanceAngle = 45;
-        avoidanceDistance = 200;
+        avoidanceDistance = 120;
       } else if (obstacles.obstacleSensors == 0b001) {
         avoidanceAngle = -45;
-        avoidanceDistance = 200;
+        avoidanceDistance = 120;
       } else if (obstacles.obstacleSensors == 0b010) {
         avoidanceAngle = (random(2) == 0) ? 60 : -60;
-        avoidanceDistance = 250;
+        avoidanceDistance = 150;
       } else if (obstacles.obstacleSensors == 0b110) {
         avoidanceAngle = 90;
         avoidanceDistance = 150;
@@ -1078,8 +1138,10 @@ void loop() {
         "DEBUG: -1, ID: %s, Resumiendo: estado=%d, valor=%.1f",
         robotID.c_str(), intContext.previousState, intContext.remainingValue);
 
-    if (bug2.isActive) {
-      // Navegación activa: re-solicitar posición para recalcular ruta
+    if (bug2.isActive || nav.isActive) {
+      // Navegación activa: re-solicitar posición para recalcular ruta en vez
+      // de terminar a ciegas el segmento interrumpido (nav.isActive faltaba
+      // tras la migración a ReactiveNav — causaba desvíos largos al evadir)
       MessageDebugf(
           "DEBUG: -1, ID: %s, GT activo: solicitando posición post-evasión",
           robotID.c_str());
@@ -2364,16 +2426,27 @@ void ReadUdpPackets() {
       float angleDiff = NormalizeAngle(newAngle - robotPose.angle);
 
       if (distanceJump > max_pose_jump || abs(angleDiff) > max_angle_jump) {
-        char buffer[150];
-        snprintf(buffer, sizeof(buffer),
-                 "WARNING: Salto brusco detectado. ΔPos=%.1fmm, ΔAng=%.1f°. "
-                 "Ignorando actualización.",
-                 distanceJump, angleDiff);
-        MessageDebugf("DEBUG: -1, ID: %s, %s", robotID.c_str(), buffer);
-        return;
+        // Saltos consistentes = la pose interna quedó obsoleta (robot movido a
+        // mano, cambio de origen). Tras varios rechazos seguidos, re-sincronizar
+        // con la cámara en vez de quedar atrapado ignorando para siempre.
+        poseJumpRejections++;
+        if (poseJumpRejections < max_pose_jump_rejections) {
+          char buffer[150];
+          snprintf(buffer, sizeof(buffer),
+                   "WARNING: Salto brusco detectado. ΔPos=%.1fmm, ΔAng=%.1f°. "
+                   "Ignorando actualización (%d/%d).",
+                   distanceJump, angleDiff, poseJumpRejections,
+                   max_pose_jump_rejections);
+          MessageDebugf("DEBUG: -1, ID: %s, %s", robotID.c_str(), buffer);
+          return;
+        }
+        MessageDebugf("DEBUG: -1, ID: %s, WARNING: %d saltos consecutivos — "
+                      "re-sincronizando pose con la cámara.",
+                      robotID.c_str(), poseJumpRejections);
       }
     }
 
+    poseJumpRejections = 0;
     robotPose.x = newX;
     robotPose.y = newY;
     robotPose.angle = newAngle;
@@ -2651,6 +2724,21 @@ void ReadUdpPackets() {
         centerToWheelDistance = newDist;
         char buf[60];
         snprintf(buf, sizeof(buf), "NAV_CONFIG: wheel_dist=%.1fmm", newDist);
+        SendMessage(robots["Base"], buf);
+      }
+    } else if (arguments[1] == "YAW_SCALE") {
+      float newScale = arguments[2].toFloat();
+      if (newScale >= 0.9 && newScale <= 1.1) {
+        yawScale = newScale;
+        bool save = (arguments[3] == "SAVE");
+        if (save) {
+          preferences.begin("attabot-config", false);
+          preferences.putFloat("yaw_scale", yawScale);
+          preferences.end();
+        }
+        char buf[70];
+        snprintf(buf, sizeof(buf), "NAV_CONFIG: yaw_scale=%.4f%s", yawScale,
+                 save ? " (guardado)" : "");
         SendMessage(robots["Base"], buf);
       }
     }

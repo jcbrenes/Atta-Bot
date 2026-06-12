@@ -10,7 +10,7 @@
                 "marker_size_mm": 100,
                 "origin_x_mm": -1257.7,
                 "origin_y_mm": -341.6,
-                "reference_marker_id": "5"
+                "reference_marker_id": "0"
         },
         "udp_communication": {
                 "base_ip": "192.168.1.100",
@@ -33,10 +33,10 @@
                 },
                 "2": {
                         "name": "Atta_2"
+                        
                 },
                 "3": {
-                        "name": "Atta_3",
-                        "wheel_distance": 53.5
+                        "name": "Atta_3"
                 },
                 "4": {
                         "name": "Atta_4"
