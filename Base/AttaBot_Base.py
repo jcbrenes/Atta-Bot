@@ -1,6 +1,6 @@
 import os
 os.environ['QT_QPA_PLATFORM'] = 'xcb'  # forzar xcb — cv2 no tiene plugin wayland
-import cv2, json, math, time, socket, threading, csv, multiprocessing, threading, platform
+import cv2, json, math, re, time, socket, threading, csv, multiprocessing, threading, platform
 import numpy as np
 import readline
 from datetime import datetime
@@ -310,6 +310,8 @@ class Base(object):
         self.coverageGrid = None          # grilla de cobertura: -1=libre, else robot_id
         self.cellPx = 1                   # tamaño de celda en píxeles
         self.gui = None                   # referencia a AttaBotGUI (None = modo terminal)
+        # --- Calibración por robot (CALIBRATE.robotId) ---
+        self._calib = None                # estado de la rutina activa, None = inactiva
 
 
     def log(self, msg: str):
@@ -1352,6 +1354,9 @@ class Base(object):
 
                 self.addConcoleLog(timeLog, id, name, message)
 
+                if self._calib is not None and id == self._calib.get('robotID'):
+                    self._calibOnMessage(message)
+
                 parts = message.split('|')
                 command = parts[0]
 
@@ -1514,6 +1519,221 @@ class Base(object):
     # ENTRADA DE USUARIO
     # =========================================================================
 
+    # =========================================================================
+    # CALIBRACIÓN POR ROBOT (gyro yawScale + encoder PPR, cámara como patrón)
+    # =========================================================================
+
+    def _calibOnMessage(self, message):
+        """Hook desde readUdpConnection: captura eventos del robot en calibración."""
+        c = self._calib
+        if c is None:
+            return
+        m = re.search(r'TURN IMU: objetivo=(-?[\d.]+)° real=(-?[\d.]+)°', message)
+        if m:
+            c['imuReals'].append(float(m.group(2)))
+            c['lastEvent'] = time.time()
+        elif 'Giro completado' in message or 'Movimiento completado' in message:
+            c['completions'] += 1
+            c['lastEvent'] = time.time()
+        elif 'interrumpido' in message or 'failsafe' in message:
+            c['aborted'] = True
+
+
+    def _calibSampleWindow(self, robotID, duration):
+        """
+        Muestrea el ángulo ArUco (unwrap continuo desde 0) y la posición durante
+        `duration` segundos. Retorna (samples, accum, prevAngle) para encadenar
+        ventanas consecutivas sin perder la continuidad del unwrap.
+        """
+        samples = []          # (t, angleAcumulado, x, y)
+        t0 = time.time()
+        accum, prevAngle = 0.0, None
+        while time.time() - t0 < duration:
+            pose = self.currentArucoDetections.get(robotID)
+            if pose is not None:
+                x, y, a = pose
+                if prevAngle is not None:
+                    d = a - prevAngle
+                    if d > 180.0:
+                        d -= 360.0
+                    elif d < -180.0:
+                        d += 360.0
+                    accum += d
+                prevAngle = a
+                samples.append((time.time(), accum, x, y))
+            time.sleep(0.03)
+        return samples, accum, prevAngle
+
+
+    def _calibManeuver(self, robotID, robotIP, instruction, timeout=60):
+        """
+        Mide una maniobra contra la cámara: captura baseline con el robot quieto,
+        envía el comando, trackea hasta que queda quieto de nuevo.
+
+        Retorna (deltaAngle, x0, y0, x1, y1) o None si falla (marker perdido,
+        timeout o maniobra interrumpida). Los extremos son promedios de ventanas
+        de reposo (≈0.8s), inmunes al jitter de ArUco.
+        """
+        c = self._calib
+        c['imuReals'] = []
+        c['completions'] = 0
+        c['aborted'] = False
+        c['lastEvent'] = time.time()
+
+        def windowMean(window):
+            n = len(window)
+            return (sum(s[1] for s in window) / n,
+                    sum(s[2] for s in window) / n,
+                    sum(s[3] for s in window) / n)
+
+        # 1) Baseline ANTES de enviar el comando (robot quieto)
+        base, accum, prevAngle = self._calibSampleWindow(robotID, 0.8)
+        if not base:
+            print('[Calib] Robot no visible al capturar baseline — abortando')
+            return None
+        a0, x0, y0 = windowMean(base)
+
+        # 2) Enviar comando y trackear el movimiento, continuando el unwrap
+        self.sendInstruction(robotIP, [instruction], False)
+        samples = []
+        t0 = time.time()
+        lastSeen = time.time()
+        while True:
+            now = time.time()
+            pose = self.currentArucoDetections.get(robotID)
+            if pose is not None:
+                x, y, a = pose
+                d = a - prevAngle
+                if d > 180.0:
+                    d -= 360.0
+                elif d < -180.0:
+                    d += 360.0
+                accum += d
+                prevAngle = a
+                samples.append((now, accum, x, y))
+                lastSeen = now
+
+            if c['aborted']:
+                print('[Calib] Maniobra interrumpida (obstáculo/failsafe) — abortando')
+                return None
+            if now - lastSeen > 3.0:
+                print('[Calib] Marker perdido >3s — abortando')
+                return None
+            if now - t0 > timeout:
+                print('[Calib] Timeout de maniobra — abortando')
+                return None
+
+            # Fin: la maniobra (y su corrección) reportó completado, sin eventos
+            # nuevos hace 2s, y llevamos >1.5s desde el envío
+            if (c['completions'] > 0 and c['completions'] >= len(c['imuReals'])
+                    and now - c['lastEvent'] > 2.0 and now - t0 > 1.5):
+                break
+            time.sleep(0.03)
+
+        last = [s for s in samples if samples[-1][0] - s[0] <= 0.8]
+        a1, x1, y1 = windowMean(last)
+        return (a1 - a0, x0, y0, x1, y1)
+
+
+    @runOnThread
+    def startCalibration(self, robotID):
+        """
+        Rutina de calibración completa de un robot usando la cámara como patrón:
+
+        Fase 1 (gyro): YAW_SCALE=1.0 temporal, 3×TURN|360, escala = giro físico
+                       (ArUco) / giro reportado (IMU) → NAV_CONFIG|YAW_SCALE|x|SAVE
+        Fase 2 (encoders): PPR nominal temporal, 3×MOVE|500 (con TURN|180 entre
+                       avances), PPR = nominal × comandado/medido → SETPPR|x|SAVE
+
+        Requiere: robot visible, área despejada (una evasión aborta la rutina).
+        """
+        if self._calib is not None:
+            print('[Calib] Ya hay una calibración activa')
+            return
+        if robotID not in self.robots:
+            print(f"[Calib] Robot '{robotID}' no encontrado")
+            return
+        if robotID not in self.currentArucoDetections:
+            print(f'[Calib] Robot {robotID} no visible por la cámara')
+            return
+
+        robotIP = self.robots[robotID].IP
+        nominalPPR = 574.0
+        self._calib = {'robotID': robotID, 'imuReals': [], 'completions': 0,
+                       'aborted': False, 'lastEvent': time.time()}
+        try:
+            print(f'[Calib] === Calibrando robot {robotID} ({self.robots[robotID].name}) ===')
+            self.sendInstruction(robotIP, ['CONFIG|DEBUG|1'], False)
+            time.sleep(0.3)
+            # Desactivar los 3 IR: durante la calibración no queremos NINGUNA
+            # evasión (el IR izquierdo fantasma o un reflejo abortarían la rutina)
+            for s in ('L', 'R', 'C'):
+                self.sendInstruction(robotIP, [f'SENSOR_MASK|{s}|1'], False)
+            print('[Calib] Sensores IR desactivados durante la rutina')
+            time.sleep(0.5)
+
+            # --- Fase 1: escala del gyro ---
+            self.sendInstruction(robotIP, ['NAV_CONFIG|YAW_SCALE|1.0'], False)
+            time.sleep(0.5)
+            camTotal, imuTotal = 0.0, 0.0
+            for n in range(3):
+                result = self._calibManeuver(robotID, robotIP, 'TURN|360')
+                if result is None:
+                    return
+                deltaCam = result[0]
+                deltaImu = sum(self._calib['imuReals'])
+                if abs(deltaImu) < 300:
+                    print(f'[Calib] IMU reportó {deltaImu:.1f}° (esperado ~360) — abortando')
+                    return
+                camTotal += deltaCam
+                imuTotal += deltaImu
+                print(f'[Calib] Giro {n+1}/3: cámara={deltaCam:+.1f}° IMU={deltaImu:+.1f}°')
+
+            yawScale = camTotal / imuTotal
+            if not 0.9 <= yawScale <= 1.1:
+                print(f'[Calib] yaw_scale={yawScale:.4f} fuera de rango [0.9,1.1] — abortando')
+                return
+            self.sendInstruction(robotIP, [f'NAV_CONFIG|YAW_SCALE|{yawScale:.4f}|SAVE'], False)
+            print(f'[Calib] ✓ yaw_scale={yawScale:.4f} guardado en flash')
+            time.sleep(0.5)
+
+            # --- Fase 2: PPR de encoders ---
+            self.sendInstruction(robotIP, [f'SETPPR|{nominalPPR:.0f}|TEMP'], False)
+            time.sleep(0.5)
+            distances = []
+            for n in range(3):
+                result = self._calibManeuver(robotID, robotIP, 'MOVE|500')
+                if result is None:
+                    return
+                _, x0, y0, x1, y1 = result
+                dist = math.hypot(x1 - x0, y1 - y0)
+                if dist < 250:
+                    print(f'[Calib] Avance midió {dist:.0f}mm (esperado ~500) — abortando')
+                    return
+                distances.append(dist)
+                print(f'[Calib] Avance {n+1}/3: cámara={dist:.1f}mm')
+                # Volver sobre sus pasos para no salir del área (yaw ya calibrado)
+                result = self._calibManeuver(robotID, robotIP, 'TURN|180')
+                if result is None:
+                    return
+
+            measured = sum(distances) / len(distances)
+            newPPR = nominalPPR * 500.0 / measured
+            if not 400 <= newPPR <= 800:
+                print(f'[Calib] PPR={newPPR:.1f} fuera de rango [400,800] — abortando')
+                return
+            self.sendInstruction(robotIP, [f'SETPPR|{newPPR:.1f}|SAVE'], False)
+            print(f'[Calib] ✓ PPR={newPPR:.1f} guardado en flash (medido {measured:.1f}mm/500mm)')
+            print(f'[Calib] === Robot {robotID} calibrado: yaw_scale={yawScale:.4f}, PPR={newPPR:.1f} ===')
+        finally:
+            # Reactivar IR (default firmware). El IR izquierdo fantasma sigue
+            # presente: re-enviar SENSOR_MASK|L|1 si se va a navegar tras calibrar.
+            for s in ('L', 'R', 'C'):
+                self.sendInstruction(robotIP, [f'SENSOR_MASK|{s}|0'], False)
+            print('[Calib] Sensores IR reactivados (re-enviar SENSOR_MASK|L|1 si hace falta)')
+            self._calib = None
+
+
     @runOnThread
     def inputInstruction(self):
         """
@@ -1544,6 +1764,8 @@ class Base(object):
                 self.sendInstruction(robotIP, [instruction], True)
             elif robotId == 'CONGREGATION':
                 self.startCongregation(instruction)
+            elif robotId == 'CALIBRATE':
+                self.startCalibration(instruction)
             elif robotId == 'GOTO':
                 parts = instruction.split()
                 if len(parts) == 3:
