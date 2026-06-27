@@ -1,0 +1,15 @@
+# AttaBot — esquema min_spiffs (1.9MB APP con OTA / 128KB SPIFFS)
+# Fijado en el repo para garantizar el layout sin depender del menú del IDE.
+# El sketch (~1.18MB) pasa de 90% (default, 1.31MB/slot) a ~60% (1.97MB/slot).
+# NVS en 0x9000 = mismo offset que el default -> la calibracion (yaw_scale/PPR) se preserva.
+# OJO 1: cambia la tabla de particiones -> el PRIMER flasheo de cada robot debe ser por USB/serial.
+# OJO 2: este archivo MANDA sobre la tabla flasheada (prebuild hook lo copia con prioridad), PERO
+#        el chequeo de tamano del IDE usa upload.maximum_size del MENU. Para que reporte ~60% (y no
+#        de "Sketch too big" falso al crecer): Tools -> Partition Scheme -> "Minimal SPIFFS (1.9MB APP...)".
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x1E0000,
+app1,     app,  ota_1,   0x1F0000,0x1E0000,
+spiffs,   data, spiffs,  0x3D0000,0x20000,
+coredump, data, coredump,0x3F0000,0x10000,

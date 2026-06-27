@@ -207,7 +207,10 @@ ReactiveNav nav;
 // IMU-assisted TURN: giro cerrado en yaw — el arco restante se re-apunta con
 // el IMU en cada ciclo, y al final se corrige si quedó residuo
 bool  imuTurnActive   = false;
-bool  imuTurnIsCorrection = false;  // true mientras se ejecuta una micro-corrección (máx 1 por TURN)
+bool  imuTurnIsCorrection = false;  // el residuo se cierra SIN brake-lead (lead=0);
+                                    // si no, en arcos chicos el coast reservado se
+                                    // come la corrección entera (cmd -5.3° → real 0.8°)
+int   imuTurnCorrCount = 0;         // correcciones hechas en este giro (tope: imuTurnMaxCorrections)
 float imuTurnStartYaw = 0.0f;
 float imuTurnPrevYaw  = 0.0f;    // última lectura para unwrap incremental
 float imuTurnAccumDeg = 0.0f;    // giro acumulado medido por IMU (sin wrap, soporta >180°)
@@ -217,8 +220,10 @@ const float imuTurnBrakeLead = 3.0f;   // cortar motores N° antes: la inercia
                                        // (coast, 2-12° medido vs ArUco) completa el giro
 const unsigned long imuTurnSettleMs = 400;  // ventana para que el coast termine
                                             // antes de la verificación final
-const float imuTurnTolerance = 5.0f;   // residuo (coast incluido) que dispara la
-                                       // micro-corrección — ahora closed-loop, aterriza bien
+const float imuTurnTolerance = 3.0f;   // residuo bajo el cual el giro se da por bueno;
+                                       // con corrección iterativa ahora sí aterriza acá
+const int imuTurnMaxCorrections = 4;   // tope de correcciones por giro — evita
+                                       // perseguir el ruido del gyro indefinidamente
 const int instructionCompletedDelay = 400;
 std::array<float, 2> fsmInstruction;
 std::deque<std::array<float, 2>> instructionList;
@@ -697,21 +702,27 @@ void loop() {
 
         float delta = imuTurnAccumDeg;           // unwrapped: válido >180°
         float error = imuTurnTargetDeg - delta;  // positivo = giró de menos
-        MessageDebugf("DEBUG: -1, ID: %s, TURN IMU: objetivo=%.1f° real=%.1f° error=%.1f° (yaw %.1f→%.1f)",
+        MessageDebugf("DEBUG: -1, ID: %s, TURN IMU: objetivo=%.1f° real=%.1f° error=%.1f° corr#%d (yaw %.1f→%.1f)",
                       robotID.c_str(), imuTurnTargetDeg, delta, error,
-                      imuTurnStartYaw, yaw);
+                      imuTurnCorrCount, imuTurnStartYaw, yaw);
 
-        if (abs(error) > imuTurnTolerance && !imuTurnIsCorrection) {
-          // Encolar UNA micro-corrección; la corrección no genera otra
+        if (abs(error) > imuTurnTolerance &&
+            imuTurnCorrCount < imuTurnMaxCorrections) {
+          // Closed-loop iterativo: encolar otra corrección y volver a medir
+          // tras su settle. Ya no es de un solo tiro — itera hasta |error|<tol
+          // o agotar imuTurnMaxCorrections. La corrección corre SIN brake-lead
+          // (ver rama de manejo) para que el arco chico no se cancele solo.
           float corrArc = radians(error) * centerToWheelDistance;
           fsmInstruction[0] = TURN;
           fsmInstruction[1] = corrArc;
           instructionList.push_front(fsmInstruction);
           imuTurnIsCorrection = true;
-          MessageDebugf("DEBUG: -1, ID: %s, TURN corrección: %.1f° (arc=%.1fmm)",
-                        robotID.c_str(), error, corrArc);
+          imuTurnCorrCount++;
+          MessageDebugf("DEBUG: -1, ID: %s, TURN corrección #%d: %.1f° (arc=%.1fmm)",
+                        robotID.c_str(), imuTurnCorrCount, error, corrArc);
         } else {
           imuTurnIsCorrection = false;
+          imuTurnCorrCount    = 0;
         }
         imuTurnActive = false;
         movementReady = true;
@@ -727,11 +738,16 @@ void loop() {
                         robotID.c_str(), imuTurnAccumDeg, imuTurnTargetDeg);
           imuTurnActive       = false;
           imuTurnIsCorrection = false;
+          imuTurnCorrCount    = 0;
           movementReady       = true;
         } else {
-          // Frenar imuTurnBrakeLead antes del objetivo: el coast completa
-          float lead = (imuTurnTargetDeg >= 0) ? imuTurnBrakeLead
-                                               : -imuTurnBrakeLead;
+          // Frenar imuTurnBrakeLead antes del objetivo: la inercia completa el
+          // giro. PERO en una corrección el arco es chico y no hay momento que
+          // costear → lead=0; con lead la corrección se cancelaría a sí misma.
+          float lead = imuTurnIsCorrection
+                           ? 0.0f
+                           : ((imuTurnTargetDeg >= 0) ? imuTurnBrakeLead
+                                                      : -imuTurnBrakeLead);
           float remainingArc =
               radians(imuTurnTargetDeg - lead - imuTurnAccumDeg) *
               centerToWheelDistance;
@@ -778,6 +794,7 @@ void loop() {
 
       imuTurnActive = false;  // cancelar seguimiento IMU si el giro fue interrumpido
       imuTurnIsCorrection = false;
+      imuTurnCorrCount = 0;
       state = STOP;
     }
 
@@ -2790,6 +2807,9 @@ void ReadUdpPackets() {
     bug2.Reset();
     navTarget.Reset();
     instructionList.clear();
+    imuTurnActive       = false;  // si se abortó a mitad de un giro, no dejar el
+    imuTurnIsCorrection = false;  // tracking IMU activo: el próximo TURN debe
+    imuTurnCorrCount    = 0;      // reinicializarse limpio (start yaw/accum/target)
     state = STOP;
     SendMessage(robots["Base"], "GT abortado");
     MessageDebugf("DEBUG: -1, ID: %s, Navegación abortada manualmente",
