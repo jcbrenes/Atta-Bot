@@ -1,0 +1,26 @@
+.venv/
+Base/.venv/
+venv/
+env/
+Base/ConsoleLogs/
+Base/PositionLogs/
+Base/Videos/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.dist-info/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.env
+
+# Arduino build artifacts (regenerados en cada compilación)
+build/
+
+# Logs experimentales (los datos quedan en disco, no se versionan)
+Logs/
+Base/Logs/
+
+# Figuras de salida de la simulación (se regeneran al correr la sim)
+sim_output_*.png
