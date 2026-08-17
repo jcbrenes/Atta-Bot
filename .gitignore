@@ -35,17 +35,11 @@ Base/Logs/
 sim_output_*.png
 Base/markers_svg/
 
-# Figuras que deja analyze_logs.py --plot (se regeneran desde los logs).
-# Sin anclar a Base/: también caen dentro de las carpetas de campaña
-# (Base/simulacion_31-07/, etc.), donde los CSV sí se versionan y las figuras no.
+# Figuras que deja analyze_logs.py --plot (se regeneran desde los logs)
 congreg_*.png
 
-# Videos de la campana de simulacion: 1.8GB, no van al repo
-Base/simulacion_31-07/Videos/
-
-# Copia del dataset que armo el usuario para compartir (incluye videos)
-Base/analisis_30-07/data/
-Base/analisis_30-07.zip
+# Copias de trabajo del firmware fuera del sketch
+Controller/*.cpp
 
 # Salida de arduino-cli (el .bin se regenera con: python3 OTA.py --build)
 Controller/AttaBot/build/

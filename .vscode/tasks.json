@@ -100,14 +100,14 @@
         {
             "label": "métricas: sesión más reciente",
             "type": "shell",
-            "command": "${workspaceFolder}/Base/.venv/bin/python analisis/analyze_logs.py",
+            "command": "${workspaceFolder}/Base/.venv/bin/python herramientas/analyze_logs.py",
             "options": { "cwd": "${workspaceFolder}/Base" },
             "problemMatcher": []
         },
         {
             "label": "métricas: histórico completo",
             "type": "shell",
-            "command": "${workspaceFolder}/Base/.venv/bin/python analisis/analyze_logs.py --all",
+            "command": "${workspaceFolder}/Base/.venv/bin/python herramientas/analyze_logs.py --all",
             "options": { "cwd": "${workspaceFolder}/Base" },
             "problemMatcher": []
         }

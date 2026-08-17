@@ -9,7 +9,12 @@ Documentation for the Atta-Bot swarm robotics system
 - Electronic diagrams
 - System Architecture and logic diagrams
 
-The topology-aggregation paper is not kept here: it has several authors and is
-edited on Overleaf, so it lives in `~/Documents/AttaBot-Paper`. The scripts that
-produce its figures (`Base/analisis/figuras_paper.py paper`, `Base/analisis/figura_escenarios.py`)
-write straight into that folder.
+| | |
+|---|---|
+| `comandos.md` | reference sheet for every command the base and the robots accept |
+| `formaciones.md` | how the line / wedge / circle formations are computed and used |
+| `HW_Test.md` | hardware diagnostic sketch |
+
+Papers and study reports written on top of this platform are not kept here: they
+have their own authors, deadlines and repositories. This folder documents the
+platform itself, so that the work can be reproduced.

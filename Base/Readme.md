@@ -24,30 +24,15 @@ se quedan en la raíz y no en una subcarpeta: moverlos rompe el arranque en el l
 salvo que se editen a la vez el JSON y `herramientas/Calibrar.py`, que es quien
 los escribe.
 
-### `analisis/` — el análisis del paper
+### `herramientas/` — análisis, banco, calibración y diagnóstico
 
 | | |
 |---|---|
-| `analyze_logs.py` | métricas por corrida y por campaña; el motor de todo lo demás |
-| `figuras_paper.py` | figuras del artículo y de revisión |
-| `figura_escenarios.py` | planta de los escenarios, laboratorio y simulación |
-| `extraer_geometria.py` | mide la geometría real desde los videos cenitales |
+| `analyze_logs.py` | métricas de navegación por corrida y por campaña |
 | `scan_logs.py` | escáner de anomalías sobre todos los logs |
-| `campana_lab_30-07.csv` | manifiesto de la campaña del laboratorio |
-
-Se corren desde `Base/`, no desde adentro de `analisis/`:
-
-```sh
-python analisis/analyze_logs.py --campaign analisis/campana_lab_30-07.csv
-python analisis/figuras_paper.py paper
-```
-
-### `herramientas/` — banco, calibración y diagnóstico
-
-| | |
-|---|---|
+| `recortar_video.py` | recorta los videos por el reloj de los logs |
 | `check_system.py` | verifica cámara, red y dependencias |
-| `ir_check.py` | infrarrojos: monitor, potenciómetro, umbral, motores |
+| `ir_check.py` | infrarrojos y sensor de color: monitor, umbral, calibración |
 | `turn_check.py` | mide el error de giro contra los logs de posición |
 | `aruco_test.py` | detección de markers en vivo |
 | `Calibrar.py` | calibración de cámara; escribe `cameraMatrix.txt` |
@@ -56,8 +41,17 @@ python analisis/figuras_paper.py paper
 | `test_network_config.py` | prueba de la configuración de red |
 | `ValidacionRandomWalk.py` | validación del random walk |
 
+Se corren desde `Base/`, no desde adentro de `herramientas/`, porque la ruta a la
+calibración de la cámara es relativa al directorio de trabajo:
+
+```sh
+python herramientas/analyze_logs.py            # sesión más reciente
+python herramientas/analyze_logs.py --all      # histórico
+python herramientas/scan_logs.py
+```
+
 ### Directorios de datos
 
-`PositionLogs/` y `ConsoleLogs/` guardan los logs de cada corrida. `Videos/` y
-`Logs/` no se versionan. `analisis_30-07/` y `simulacion_31-07/` son los paquetes
-de datos que se le pasaron a Juan Carlos, cada uno con su `LEEME.md`.
+`PositionLogs/` y `ConsoleLogs/` guardan los logs de cada corrida; `Videos/` y
+`Logs/`, el video cenital y el mapa cuadro↔tiempo. **Ninguno se versiona**: los
+datos de cada campaña se archivan aparte, junto al trabajo que los usa.

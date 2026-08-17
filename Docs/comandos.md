@@ -170,7 +170,7 @@ BROADCAST.RANDOMW                   dispersar
 BROADCAST.MEET|1200|850             congregar sobre un punto
 ```
 
-Análisis: `python3 analisis/analyze_logs.py --congregation`
+Análisis: `python3 herramientas/analyze_logs.py --congregation`
 
 ### Dispersión
 

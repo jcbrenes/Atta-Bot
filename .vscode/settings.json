@@ -12,8 +12,6 @@
         "Controller/AttaBot/build": true,
         "Base/PositionLogs": true,
         "Base/ConsoleLogs": true,
-        "Base/Videos": true,
-        "Base/analisis_30-07": true,
-        "Base/simulacion_31-07": true
+        "Base/Videos": true
     }
 }
